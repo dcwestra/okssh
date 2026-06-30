@@ -1416,6 +1416,42 @@ _detect_key_type() {
 }
 
 cmd_import_key() {
+    # Non-interactive mode: import-key <alias> <keyfile> <host> <user> [port] [note] [group] [jump]
+    if [ "$#" -ge 4 ]; then
+        IK_ALIAS=$(sanitize_alias "$1")
+        IK_SRC=$(printf '%s' "$2" | sed "s|^~|$HOME|")
+        IK_HOST="$3"
+        IK_USER="$4"
+        IK_PORT="${5:-22}"
+        IK_NOTE="${6:-}"
+        IK_GROUP="${7:-}"
+        IK_JUMP="${8:-}"
+        [ -z "$IK_ALIAS" ] && die "Alias cannot be empty"
+        [ ! -f "$IK_SRC" ]  && die "Key file not found: $IK_SRC"
+        [ -z "$IK_HOST" ]   && die "Host cannot be empty"
+        [ -z "$IK_USER" ]   && die "User cannot be empty"
+        case "$IK_PORT" in ''|*[!0-9]*) IK_PORT=22 ;; esac
+        IK_TYPE=$(_detect_key_type "$IK_SRC")
+        mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+        IK_DEST="$SSH_DIR/id_${IK_TYPE}_${IK_ALIAS}"
+        if [ "$IK_SRC" != "$IK_DEST" ]; then
+            cp "$IK_SRC" "$IK_DEST"; chmod 600 "$IK_DEST"
+        else
+            chmod 600 "$IK_DEST"
+        fi
+        if [ ! -f "${IK_DEST}.pub" ]; then
+            ssh-keygen -y -f "$IK_DEST" > "${IK_DEST}.pub" 2>/dev/null \
+                && chmod 644 "${IK_DEST}.pub" \
+                || printf 'warn: could not extract public key\n' >&2
+        fi
+        write_config_block "$IK_ALIAS" "$IK_HOST" "$IK_USER" "$IK_PORT" \
+            "$IK_DEST" "$IK_JUMP" "$IK_NOTE" "" "" "" "$IK_GROUP"
+        sync_auto_export
+        sync_keys_update
+        printf 'ok: %s\n' "$IK_ALIAS"
+        return
+    fi
+
     [ "$HAS_WHIPTAIL" -eq 0 ] && {
         printf '\n  This will:\n'
         printf '    1. Collect connection details\n'
@@ -5889,7 +5925,7 @@ check_deps
 case "${1:-}" in
     "")                interactive_menu ;;
     add)               cmd_add ;;
-    import-key)        cmd_import_key ;;
+    import-key)        shift; cmd_import_key "$@" ;;
     connect)           shift; cmd_connect "$@" ;;
     ls|list)           shift; cmd_list "$@" ;;
     info)              cmd_info   "${2:-}" ;;
