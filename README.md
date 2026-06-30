@@ -12,6 +12,7 @@ Works as a full TUI (whiptail menus) or a plain CLI. One shell script, no compil
 
 - **Named SSH aliases** stored in `~/.ssh/config` — aliases work directly with `ssh` too
 - **Per-alias key generation** — unique key per alias (ed25519, RSA-4096, or ECDSA-521), copied to remote on add
+- **Key import** — register an existing private key sent to you (no keygen, no `ssh-copy-id`) with `okssh import-key`
 - **Key rotation** — generate and deploy a new key without touching the old one until confirmed
 - **Key age audit** — flag keys older than a configurable threshold; warns at startup
 - **Groups / tags** — tag aliases (`homelab`, `work`, `prod`) and filter with `okssh ls --group <g>`
@@ -100,6 +101,7 @@ okssh [-v] <command> [args]
 
 ```sh
 okssh add                        # Guided wizard — alias, host, user, port, group, key type
+okssh import-key                 # Register a private key sent to you — no keygen, no ssh-copy-id
 okssh connect <alias>            # Connect to a saved alias
 okssh connect <alias> --agent    # Connect and auto-load key into ssh-agent first
 okssh connect <alias> --sshpass   # Connect using a prompted (or stored) password
@@ -364,11 +366,13 @@ okssh -v <command>               # Verbose — show background operations
 
 1. Prompts for alias name, hostname/IP, port, username, optional note, and group tags
 2. Optionally configures a jump/bastion host and advanced SSH options
-3. Prompts for key type (ed25519 / rsa / ecdsa) — or uses the configured default
-4. Generates a unique key pair for this alias
-5. Copies the public key to the remote using `ssh-copy-id` (password used once, never stored)
-6. Writes a named block to `~/.ssh/config`
-7. After setup, connect with `okssh connect <alias>` or directly with `ssh <alias>`
+3. Asks whether you have an existing private key to import:
+   - **Yes (import):** provide the key file path — okssh copies it to `~/.ssh/`, extracts the public key, and skips `ssh-copy-id`. Use this when a server admin has already added your public key.
+   - **No (generate):** prompts for key type (ed25519 / rsa / ecdsa), generates a unique key pair, and copies the public key to the remote with `ssh-copy-id` (password used once, never stored)
+4. Writes a named block to `~/.ssh/config`
+5. After setup, connect with `okssh connect <alias>` or directly with `ssh <alias>`
+
+You can also run `okssh import-key` directly to register a key for a new or existing alias at any time.
 
 ---
 
