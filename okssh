@@ -1301,40 +1301,82 @@ _TTEOF
         fi
     fi
 
-    wt_password "Remote password"
-    REMOTE_PASS="$_PROMPT_RESULT"
+    # Key source — ask before prompting for a password
+    _add_import_src=""
+    if wt_yesno "Do you have a private key file to import?\n(Say Yes if a server admin sent you a key file — no keygen needed)"; then
+        wt_input "Path to the private key file" ""
+        while true; do
+            [ "$_PROMPT_CANCELLED" -eq 1 ] && { printf '  Cancelled.\n\n'; return 0; }
+            _add_import_src=$(printf '%s' "$_PROMPT_RESULT" | sed "s|^~|$HOME|")
+            if [ -z "$_add_import_src" ]; then
+                wt_msg "Key file path cannot be empty."
+                wt_input "Path to key file" ""
+            elif [ ! -f "$_add_import_src" ]; then
+                wt_msg "File not found: $_add_import_src"
+                wt_input "Path to key file" ""
+            else
+                break
+            fi
+        done
+        info "Will import: ${C_BOLD}$_add_import_src${C_RESET}"
+    fi
 
     prompt_advanced
 
-    _def_ktype=$(pref_get "key_type"); [ -z "$_def_ktype" ] && _def_ktype="ed25519"
-    [ -n "$_T_KTYPE" ] && _def_ktype="$_T_KTYPE"
-    wt_input "SSH key type (ed25519 / rsa / ecdsa)" "$_def_ktype"
-    case "$_PROMPT_RESULT" in
-        ed25519|rsa|ecdsa) KEY_TYPE="$_PROMPT_RESULT" ;;
-        *) KEY_TYPE="$_def_ktype"
-           [ -n "$_PROMPT_RESULT" ] && warn "Unknown key type — using $KEY_TYPE" ;;
-    esac
-
     mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
-    KEY_FILE="$SSH_DIR/id_${KEY_TYPE}_${ALIAS}"
 
-    if [ -f "$KEY_FILE" ]; then
-        warn "Key already exists — reusing: $KEY_FILE"
+    if [ -n "$_add_import_src" ]; then
+        # ── Import path: copy existing key, skip password + ssh-copy-id ───────
+        KEY_TYPE=$(_detect_key_type "$_add_import_src")
+        KEY_FILE="$SSH_DIR/id_${KEY_TYPE}_${ALIAS}"
+        if [ "$_add_import_src" != "$KEY_FILE" ]; then
+            cp "$_add_import_src" "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+            success "Key copied to: $KEY_FILE"
+        else
+            chmod 600 "$KEY_FILE"
+            info "Key is already at the target path — permissions set."
+        fi
+        if [ ! -f "${KEY_FILE}.pub" ]; then
+            ssh-keygen -y -f "$KEY_FILE" > "${KEY_FILE}.pub" 2>/dev/null && {
+                chmod 644 "${KEY_FILE}.pub"
+                success "Public key extracted."
+            } || warn "Could not extract public key — agent/audit may be limited."
+        fi
     else
-        info "Generating ${KEY_TYPE} key: $KEY_FILE"
-        _keygen "$KEY_FILE" "$KEY_TYPE" "${REMOTE_USER}@${REMOTE_HOST}-${ALIAS}"
-        chmod 600 "$KEY_FILE"; chmod 644 "${KEY_FILE}.pub"
-        success "Key generated."
-    fi
+        # ── Generate path: existing flow ──────────────────────────────────────
+        wt_password "Remote password"
+        REMOTE_PASS="$_PROMPT_RESULT"
 
-    info "Copying public key to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT} ..."
-    if copy_key_to_remote "$KEY_FILE" "$REMOTE_USER" "$REMOTE_HOST" \
-            "$REMOTE_PORT" "$REMOTE_PASS" "$JUMP_HOST"; then
-        unset REMOTE_PASS
-        success "Public key copied. Password cleared from memory."
-    else
-        unset REMOTE_PASS
-        die "Key copy failed — check the connection and try again."
+        _def_ktype=$(pref_get "key_type"); [ -z "$_def_ktype" ] && _def_ktype="ed25519"
+        [ -n "$_T_KTYPE" ] && _def_ktype="$_T_KTYPE"
+        wt_input "SSH key type (ed25519 / rsa / ecdsa)" "$_def_ktype"
+        case "$_PROMPT_RESULT" in
+            ed25519|rsa|ecdsa) KEY_TYPE="$_PROMPT_RESULT" ;;
+            *) KEY_TYPE="$_def_ktype"
+               [ -n "$_PROMPT_RESULT" ] && warn "Unknown key type — using $KEY_TYPE" ;;
+        esac
+
+        KEY_FILE="$SSH_DIR/id_${KEY_TYPE}_${ALIAS}"
+
+        if [ -f "$KEY_FILE" ]; then
+            warn "Key already exists — reusing: $KEY_FILE"
+        else
+            info "Generating ${KEY_TYPE} key: $KEY_FILE"
+            _keygen "$KEY_FILE" "$KEY_TYPE" "${REMOTE_USER}@${REMOTE_HOST}-${ALIAS}"
+            chmod 600 "$KEY_FILE"; chmod 644 "${KEY_FILE}.pub"
+            success "Key generated."
+        fi
+
+        info "Copying public key to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT} ..."
+        if copy_key_to_remote "$KEY_FILE" "$REMOTE_USER" "$REMOTE_HOST" \
+                "$REMOTE_PORT" "$REMOTE_PASS" "$JUMP_HOST"; then
+            unset REMOTE_PASS
+            success "Public key copied. Password cleared from memory."
+        else
+            unset REMOTE_PASS
+            die "Key copy failed — check the connection and try again."
+        fi
     fi
 
     write_config_block "$ALIAS" "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" \
