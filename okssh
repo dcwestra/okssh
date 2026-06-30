@@ -15,6 +15,7 @@
 #   okssh [-v] rotate <alias>               Rotate SSH key for an alias
 #   okssh [-v] export [file]                Export aliases to a portable file
 #   okssh [-v] import <file>                Import aliases from export file
+#   okssh [-v] import-key                   Register a private key sent to you (no keygen)
 #   okssh [-v] run    <alias> <cmd>         Run a one-off remote command
 #   okssh [-v] copy   <src>   <dst>         Copy files via sftp (alias:/path)
 #   okssh [-v] status                       Test all connections (dashboard)
@@ -1350,6 +1351,156 @@ _TTEOF
     printf "  Connect with:  ${C_BOLD}${C_GREEN}ssh %s${C_RESET}\n\n" "$ALIAS"
 }
 
+# ── IMPORT-KEY ────────────────────────────────────────────────────────────────
+
+# Detect SSH key type from a private key file.
+# Tries ssh-keygen -l first; falls back to parsing the header line.
+_detect_key_type() {
+    _dkt_file="$1"
+    _dkt_out=$(ssh-keygen -l -f "$_dkt_file" 2>/dev/null) && {
+        case "$_dkt_out" in
+            *RSA*)          printf 'rsa'     ; return ;;
+            *ECDSA*)        printf 'ecdsa'   ; return ;;
+            *ED25519*|*ed25519*) printf 'ed25519'; return ;;
+        esac
+    }
+    # fallback: check PEM header
+    _dkt_hdr=$(head -1 "$_dkt_file" 2>/dev/null)
+    case "$_dkt_hdr" in
+        *RSA*)  printf 'rsa'   ;;
+        *EC*)   printf 'ecdsa' ;;
+        *)      printf 'ed25519' ;;
+    esac
+}
+
+cmd_import_key() {
+    [ "$HAS_WHIPTAIL" -eq 0 ] && {
+        printf '\n  This will:\n'
+        printf '    1. Collect connection details\n'
+        printf '    2. Register an existing private key you already have\n'
+        printf '    3. Write a named alias to ~/.ssh/config\n'
+        printf "    4. Connect with: ${C_BOLD}ssh <alias>${C_RESET}\n\n"
+        printf "  ${C_DIM}Use this when a server admin sent you a private key file\n"
+        printf "  (e.g. id_rsa, key.pem) and the server already trusts it.${C_RESET}\n\n"
+    }
+
+    wt_input "Alias name (e.g. work-server, client-vps)" ""
+    while [ "$_PROMPT_CANCELLED" -eq 0 ] && [ -z "$_PROMPT_RESULT" ]; do
+        wt_msg "Alias cannot be empty."; wt_input "Alias name" ""
+    done
+    [ "$_PROMPT_CANCELLED" -eq 1 ] && { printf '  Cancelled.\n\n'; return 0; }
+    IK_ALIAS=$(sanitize_alias "$_PROMPT_RESULT")
+    [ -z "$IK_ALIAS" ] && die "Alias contains no valid characters."
+    info "Using alias: ${C_BOLD}$IK_ALIAS${C_RESET}"
+
+    if alias_exists "$IK_ALIAS"; then
+        if wt_yesno "Alias \"$IK_ALIAS\" already exists. Overwrite it?"; then
+            remove_config_block "$IK_ALIAS"
+            success "Existing alias removed."
+        else
+            printf '  Aborting.\n'; return 0
+        fi
+    fi
+
+    wt_input "Path to the private key file you received" ""
+    while true; do
+        [ "$_PROMPT_CANCELLED" -eq 1 ] && { printf '  Cancelled.\n\n'; return 0; }
+        IK_SRC=$(printf '%s' "$_PROMPT_RESULT" | sed "s|^~|$HOME|")
+        if [ -z "$IK_SRC" ]; then
+            wt_msg "Key file path cannot be empty."; wt_input "Path to key file" ""
+        elif [ ! -f "$IK_SRC" ]; then
+            wt_msg "File not found: $IK_SRC"; wt_input "Path to key file" ""
+        else
+            break
+        fi
+    done
+    info "Key file: ${C_BOLD}$IK_SRC${C_RESET}"
+
+    # Detect key type
+    IK_TYPE=$(_detect_key_type "$IK_SRC")
+    info "Detected key type: ${C_BOLD}$IK_TYPE${C_RESET}"
+
+    # Destination in ~/.ssh/ following okssh naming convention
+    mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+    IK_DEST="$SSH_DIR/id_${IK_TYPE}_${IK_ALIAS}"
+
+    if [ "$IK_SRC" != "$IK_DEST" ]; then
+        cp "$IK_SRC" "$IK_DEST"
+        chmod 600 "$IK_DEST"
+        success "Key copied to: $IK_DEST"
+    else
+        chmod 600 "$IK_DEST"
+        info "Key is already at the target path — permissions set."
+    fi
+
+    # Generate public key if it doesn't exist (needed for agent/audit)
+    if [ ! -f "${IK_DEST}.pub" ]; then
+        ssh-keygen -y -f "$IK_DEST" > "${IK_DEST}.pub" 2>/dev/null && {
+            chmod 644 "${IK_DEST}.pub"
+            success "Public key extracted."
+        } || warn "Could not extract public key — agent/audit may be limited."
+    fi
+
+    wt_input "Short description / note (optional)" ""
+    IK_NOTE="$_PROMPT_RESULT"
+
+    wt_input "Group(s) / tags (optional, comma-separated, e.g. work,client)" ""
+    IK_GROUP="$_PROMPT_RESULT"
+
+    wt_input "Remote hostname or IP address" ""
+    while [ "$_PROMPT_CANCELLED" -eq 0 ] && [ -z "$_PROMPT_RESULT" ]; do
+        wt_msg "Hostname cannot be empty."; wt_input "Remote hostname or IP" ""
+    done
+    [ "$_PROMPT_CANCELLED" -eq 1 ] && { printf '  Cancelled.\n\n'; return 0; }
+    IK_HOST="$_PROMPT_RESULT"
+
+    wt_input "SSH port" "22"
+    IK_PORT="$_PROMPT_RESULT"
+    case "$IK_PORT" in ''|*[!0-9]*) IK_PORT=22 ;; esac
+
+    wt_input "Remote username" "$(whoami)"
+    while [ "$_PROMPT_CANCELLED" -eq 0 ] && [ -z "$_PROMPT_RESULT" ]; do
+        wt_msg "Username cannot be empty."; wt_input "Remote username" "$(whoami)"
+    done
+    [ "$_PROMPT_CANCELLED" -eq 1 ] && { printf '  Cancelled.\n\n'; return 0; }
+    IK_USER="$_PROMPT_RESULT"
+
+    IK_JUMP=""
+    _saved=$(list_aliases)
+    if [ -n "$_saved" ]; then
+        if wt_yesno "Route through a jump / bastion host?"; then
+            if [ "$HAS_WHIPTAIL" -eq 1 ]; then
+                if wt_pick_alias "Select first jump host:"; then
+                    IK_JUMP="$SELECTED_ALIAS"
+                    wt_input "Additional hops? (comma-separated aliases, blank = none)" ""
+                    [ -n "$_PROMPT_RESULT" ] && IK_JUMP="${IK_JUMP},${_PROMPT_RESULT}"
+                fi
+            else
+                cmd_list
+                printf "  Chains supported — e.g. bastion,internal\n"
+                cli_prompt "Jump host alias(es) (comma-separated, blank = none)" ""
+                IK_JUMP="$_PROMPT_RESULT"
+            fi
+            [ -n "$IK_JUMP" ] && info "Jump chain: ${C_BOLD}$IK_JUMP${C_RESET}"
+        fi
+    fi
+
+    prompt_advanced
+
+    write_config_block "$IK_ALIAS" "$IK_HOST" "$IK_USER" "$IK_PORT" \
+        "$IK_DEST" "$IK_JUMP" "$IK_NOTE" "$ADV_ALIVE" "$ADV_FWDAGENT" "$ADV_LOCALFWD" "$IK_GROUP"
+    success "Config written."
+
+    sync_auto_export
+    sync_keys_update
+
+    printf '\n'
+    printf "${C_CYAN}╔══════════════════════════════════════════════╗${C_RESET}\n"
+    printf "${C_CYAN}║${C_RESET}  ${C_GREEN}${C_BOLD}Key imported! ✔${C_RESET}                              ${C_CYAN}║${C_RESET}\n"
+    printf "${C_CYAN}╚══════════════════════════════════════════════╝${C_RESET}\n\n"
+    printf "  Connect with:  ${C_BOLD}${C_GREEN}ssh %s${C_RESET}\n\n" "$IK_ALIAS"
+}
+
 # ── PIN ───────────────────────────────────────────────────────────────────────
 
 cmd_pin() {
@@ -2137,7 +2288,7 @@ _cmd_prefer_alias() {
                 _wm_octets=$(printf '%s' "$_wm_norm" | tr ':' '\n' | wc -l)
                 [ "$_wm_octets" -ne 6 ] 2>/dev/null && die "Invalid MAC address: $_wm"
                 pref_set "wol_mac_${_pa}" "$_wm_norm"
-                success "WOL MAC set for \"$_pa\": $wm_norm"
+                success "WOL MAC set for \"$_pa\": $_wm_norm"
                 printf "  Send WOL packet with: ${C_BOLD}okssh wake $_pa${C_RESET}\n\n"
             fi ;;
         audit_threshold|audit-threshold)
@@ -2478,7 +2629,7 @@ EOF
 
     # Re-read sync_path pref into the now-linked file after linking
     ln -sf "$_sync_pref" "$_local_pref"
-    success "Preferences symlinked → $(_sync_path)/preferences"
+    success "Preferences symlinked → ${_sync_path}/preferences"
 
     # After linking, make sure sync_path is still written
     # (the symlink now points to the sync copy of prefs)
@@ -5161,6 +5312,7 @@ interactive_menu() {
                 --menu "Choose an action:" "$TH" "$TW" 14 \
                 "connect"   "  Connect to a saved alias" \
                 "add"       "  Add a new SSH alias" \
+                "import-key" "  Register a key sent to you (no keygen)" \
                 "info"      "  Show alias details" \
                 "test"      "  Test a connection" \
                 "status"    "  Status dashboard — all connections" \
@@ -5180,7 +5332,8 @@ interactive_menu() {
                     if wt_pick_alias "Select alias to connect:"; then
                         cmd_connect "$SELECTED_ALIAS"
                     fi ;;
-                add)    cmd_add ;;
+                add)        cmd_add ;;
+                import-key) cmd_import_key ;;
                 info)
                     if wt_pick_alias "Select alias to inspect:"; then
                         wt_show_info "$SELECTED_ALIAS"
@@ -5241,6 +5394,7 @@ interactive_menu() {
             _startup_audit_warn
             printf "  ${C_LBLUE}${C_BOLD}── Connect ──────────────────────────────────────${C_RESET}\n"
             printf "  ${C_BOLD} 1)${C_RESET} Add a new SSH alias\n"
+            printf "  ${C_BOLD}ik)${C_RESET} Import a key sent to you (no keygen)\n"
             printf "  ${C_BOLD} 2)${C_RESET} Connect to an alias\n"
             printf "  ${C_BOLD} 3)${C_RESET} List all saved aliases\n"
             printf "  ${C_BOLD} 4)${C_RESET} Show alias details\n"
@@ -5267,7 +5421,8 @@ interactive_menu() {
             printf "  ${C_BOLD} q)${C_RESET} Quit\n\n"
             cli_prompt "Choice" ""
             case "$_PROMPT_RESULT" in
-                1|add)  cmd_add ;;
+                1|add)       cmd_add ;;
+                ik|import-key) cmd_import_key ;;
                 2|connect)
                     cmd_list
                     cli_prompt "Alias to connect to" ""
@@ -5692,6 +5847,7 @@ check_deps
 case "${1:-}" in
     "")                interactive_menu ;;
     add)               cmd_add ;;
+    import-key)        cmd_import_key ;;
     connect)           shift; cmd_connect "$@" ;;
     ls|list)           shift; cmd_list "$@" ;;
     info)              cmd_info   "${2:-}" ;;
