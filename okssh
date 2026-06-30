@@ -1197,6 +1197,75 @@ cmd_template() {
 # ── ADD ───────────────────────────────────────────────────────────────────────
 
 cmd_add() {
+    # Non-interactive mode (called by sshop's native AddAliasScreen):
+    # add <alias> <host> <user> <port> <key_spec> <password> [note] [group] [jump] [alive] [fwdagent] [localfwd]
+    # key_spec: ed25519|rsa|ecdsa  → generate new key + ssh-copy-id with <password>
+    #           import:/path/key   → copy existing key, skip ssh-copy-id
+    if [ "$#" -ge 5 ]; then
+        ALIAS=$(sanitize_alias "$1")
+        REMOTE_HOST="$2"
+        REMOTE_USER="$3"
+        REMOTE_PORT="${4:-22}"
+        _ni_key_spec="$5"
+        REMOTE_PASS="${6:-}"
+        NOTE="${7:-}"
+        GROUP="${8:-}"
+        JUMP_HOST="${9:-}"
+        ADV_ALIVE="${10:-}"
+        ADV_FWDAGENT="${11:-}"
+        ADV_LOCALFWD="${12:-}"
+
+        [ -z "$ALIAS" ]       && die "Alias cannot be empty"
+        [ -z "$REMOTE_HOST" ] && die "Host cannot be empty"
+        [ -z "$REMOTE_USER" ] && die "User cannot be empty"
+        case "$REMOTE_PORT" in ''|*[!0-9]*) REMOTE_PORT=22 ;; esac
+
+        mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+
+        case "$_ni_key_spec" in
+            import:*)
+                _ni_src=$(printf '%s' "$_ni_key_spec" | sed 's|^import:||' | sed "s|^~|$HOME|")
+                [ ! -f "$_ni_src" ] && die "Key file not found: $_ni_src"
+                KEY_TYPE=$(_detect_key_type "$_ni_src")
+                KEY_FILE="$SSH_DIR/id_${KEY_TYPE}_${ALIAS}"
+                if [ "$_ni_src" != "$KEY_FILE" ]; then
+                    cp "$_ni_src" "$KEY_FILE"; chmod 600 "$KEY_FILE"
+                else
+                    chmod 600 "$KEY_FILE"
+                fi
+                if [ ! -f "${KEY_FILE}.pub" ]; then
+                    ssh-keygen -y -f "$KEY_FILE" > "${KEY_FILE}.pub" 2>/dev/null \
+                        && chmod 644 "${KEY_FILE}.pub" \
+                        || printf 'warn: could not extract public key\n' >&2
+                fi
+                ;;
+            ed25519|rsa|ecdsa)
+                KEY_TYPE="$_ni_key_spec"
+                KEY_FILE="$SSH_DIR/id_${KEY_TYPE}_${ALIAS}"
+                if [ ! -f "$KEY_FILE" ]; then
+                    _keygen "$KEY_FILE" "$KEY_TYPE" "${REMOTE_USER}@${REMOTE_HOST}-${ALIAS}"
+                    chmod 600 "$KEY_FILE"; chmod 644 "${KEY_FILE}.pub"
+                fi
+                if ! copy_key_to_remote "$KEY_FILE" "$REMOTE_USER" "$REMOTE_HOST" \
+                        "$REMOTE_PORT" "$REMOTE_PASS" "$JUMP_HOST"; then
+                    unset REMOTE_PASS
+                    die "Key copy failed — check connection and password"
+                fi
+                unset REMOTE_PASS
+                ;;
+            *)
+                die "Invalid key_spec '${_ni_key_spec}' — use ed25519/rsa/ecdsa or import:/path"
+                ;;
+        esac
+
+        write_config_block "$ALIAS" "$REMOTE_HOST" "$REMOTE_USER" "$REMOTE_PORT" \
+            "$KEY_FILE" "$JUMP_HOST" "$NOTE" "$ADV_ALIVE" "$ADV_FWDAGENT" "$ADV_LOCALFWD" "$GROUP"
+        sync_auto_export
+        sync_keys_update
+        printf 'ok: %s\n' "$ALIAS"
+        return
+    fi
+
     [ "$HAS_WHIPTAIL" -eq 0 ] && {
         printf '\n  This will:\n'
         printf '    1. Collect connection details\n'
@@ -5924,7 +5993,7 @@ check_deps
 
 case "${1:-}" in
     "")                interactive_menu ;;
-    add)               cmd_add ;;
+    add)               shift; cmd_add "$@" ;;
     import-key)        shift; cmd_import_key "$@" ;;
     connect)           shift; cmd_connect "$@" ;;
     ls|list)           shift; cmd_list "$@" ;;
