@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check (sh + bash)
+        run: |
+          sh -n okssh
+          bash -n okssh
+          sh -n okssh-completion || true
+          bash -n okssh-completion
+      - name: shellcheck
+        run: shellcheck okssh

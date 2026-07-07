@@ -1,0 +1,19 @@
+# shellcheck config for okssh
+#
+# Codes disabled globally are deliberate idioms used throughout the script;
+# anything else must pass or carry an inline "# shellcheck disable=" with a
+# reason.
+
+# Colors live in printf format strings by design (C_RED, C_BOLD, …).
+disable=SC2059
+
+# "A && B || C" is used deliberately for compact status output where B
+# cannot fail (printf/success/info).
+disable=SC2015
+
+# ls -t is used for time-sorted backup listings; the filenames are our own
+# (config.YYYYMMDD-HHMMSS) so word-splitting is safe.
+disable=SC2012
+
+# Single-quoted awk/ssh remote scripts intentionally don't expand locally.
+disable=SC2016

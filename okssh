@@ -139,7 +139,6 @@ C_GREEN='\033[0;32m'
 C_YELLOW='\033[0;33m'
 C_RED='\033[0;31m'
 C_MAGENTA='\033[0;35m'
-C_BLUE='\033[0;34m'
 C_WHITE='\033[0;37m'
 C_ORANGE='\033[38;5;214m'   # warm amber — accent colour
 C_LBLUE='\033[38;5;39m'     # bright sky-blue — primary chrome
@@ -288,7 +287,7 @@ detect_distro() {
         *arch*|*manjaro*|*endeavour*)
             WHIPTAIL_PKG="libnewt"
             WHIPTAIL_INSTALL_CMD="pacman -S --noconfirm libnewt" ;;
-        *suse*|*opensuse*)
+        *suse*)
             WHIPTAIL_PKG="newt"
             WHIPTAIL_INSTALL_CMD="zypper install -y newt" ;;
         *)
@@ -488,6 +487,7 @@ list_aliases() {
 _warn_ssh_includes() {
     [ -f "$CONFIG_FILE" ] || return 0
     grep -q '^Include ' "$CONFIG_FILE" 2>/dev/null || return 0
+    # shellcheck disable=SC2088  # display text, tilde not meant to expand
     warn "~/.ssh/config contains Include directives — okssh won't manage those hosts."
     printf "  Hosts in included files are visible to ssh but not to okssh ls/status/audit.\n\n"
 }
@@ -849,10 +849,12 @@ _bootstrap_remove() {
             [ -f "$_sf" ] || continue
             grep -qF "okssh/shell-init.sh" "$_sf" 2>/dev/null || continue
             # Remove "# okssh profile\n<source line>" block
-            sed -i '/^# okssh profile$/{N;d}' "$_sf" 2>/dev/null || \
-            sed -i'' '/^# okssh profile$/{N;d}' "$_sf" 2>/dev/null || true
+            # (double quotes here — nesting single quotes inside this
+            # single-quoted remote script would break the quoting)
+            sed -i "/^# okssh profile\$/{N;d}" "$_sf" 2>/dev/null || \
+            sed -i"" "/^# okssh profile\$/{N;d}" "$_sf" 2>/dev/null || true
             sed -i "/okssh\/shell-init.sh/d" "$_sf" 2>/dev/null || \
-            sed -i'' "/okssh\/shell-init.sh/d" "$_sf" 2>/dev/null || true
+            sed -i"" "/okssh\/shell-init.sh/d" "$_sf" 2>/dev/null || true
             printf "  cleaned %s\n" "$_sf"
         done
     '
@@ -2699,6 +2701,7 @@ cmd_sync_status() {
 
     # Symlink status
     printf "\n  ${C_BOLD}Symlink status:${C_RESET}\n"
+    # shellcheck disable=SC2043  # single item today; loop kept for future synced files
     for _f in preferences; do
         _local="$CONF_DIR/$_f"
         if [ -L "$_local" ]; then
@@ -3517,7 +3520,7 @@ _EOAL
             [ -z "$_target" ] && continue
             alias_exists "$_target" || { warn "\"$_target\" not found — skipping."; continue; }
             (
-                ssh -F "$CONFIG_FILE" \
+                ssh -n -F "$CONFIG_FILE" \
                     -o BatchMode=yes \
                     -o ConnectTimeout=15 \
                     -o StrictHostKeyChecking=accept-new \
@@ -3581,7 +3584,9 @@ _EOPRD
                         -o StrictHostKeyChecking=accept-new \
                         "$_target" "$_exec_cmd" 2>&1 | sed 's/^/    /'
             else
-                ssh -F "$CONFIG_FILE" \
+                # -n: stdin is the target list being read by this loop —
+                # without it ssh swallows the remaining targets
+                ssh -n -F "$CONFIG_FILE" \
                     -o BatchMode=yes -o ConnectTimeout=10 \
                     -o StrictHostKeyChecking=accept-new \
                     "$_target" "$_exec_cmd" 2>&1 | sed 's/^/    /'
@@ -3652,6 +3657,7 @@ cmd_snip_push() {
     else
         _psp_names=$(_bootstrap_list_names)
         [ -z "$_psp_names" ] && { warn "No bootstrapped aliases to push to."; return 1; }
+        # shellcheck disable=SC2086  # word splitting into positional args is the point
         set -- $_psp_names
     fi
     printf '\n'
@@ -3769,7 +3775,7 @@ wt_status() {
         [ -z "$_a" ] && continue
         (
             _ts=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
-            if ssh -F "$CONFIG_FILE" \
+            if ssh -n -F "$CONFIG_FILE" \
                    -o BatchMode=yes \
                    -o ConnectTimeout="$_timeout" \
                    -o StrictHostKeyChecking=accept-new \
@@ -4121,6 +4127,7 @@ _wt_snip_push() {
         "$@" \
         3>&1 1>&2 2>&3) || return 0
     [ -z "$_selected" ] && return 0
+    # shellcheck disable=SC2086  # whiptail returns space-separated hosts to split
     cmd_snip_push $_selected
 }
 
@@ -4463,7 +4470,7 @@ cmd_status() {
         [ -z "$_a" ] && continue
         (
             _ts=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
-            if ssh -F "$CONFIG_FILE" \
+            if ssh -n -F "$CONFIG_FILE" \
                    -o BatchMode=yes \
                    -o ConnectTimeout="$_timeout" \
                    -o StrictHostKeyChecking=accept-new \
