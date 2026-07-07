@@ -10,7 +10,7 @@
 #   okssh [-v] ls|list [--group <g>]        List all aliases (optionally filter by group)
 #   okssh [-v] info   <alias>               Show alias details + fingerprint
 #   okssh [-v] edit   <alias>               Edit an alias
-#   okssh [-v] rm     <alias>               Remove an alias
+#   okssh [-v] rm     <alias> [--yes] [--keys|--keep-keys]  Remove an alias
 #   okssh [-v] test   [alias]               Test one alias, or all if no alias given
 #   okssh [-v] rotate <alias>               Rotate SSH key for an alias
 #   okssh [-v] export [file]                Export aliases to a portable file
@@ -360,11 +360,16 @@ install_whiptail() {
 
 # ── UI mode resolution ────────────────────────────────────────────────────────
 
+# Env override: HAS_WHIPTAIL=0 in the environment forces CLI mode. Frontends
+# (sshop) rely on this — whiptail renders broken inside a suspended TUI
+# terminal. Must be captured before this block overwrites the variable.
+_ENV_UI="${HAS_WHIPTAIL:-}"
 HAS_WHIPTAIL=0
 _WHIPTAIL_INSTALLED=0
 command -v whiptail >/dev/null 2>&1 && _WHIPTAIL_INSTALLED=1
 
 _UI_PREF=$(pref_get "ui")
+[ "$_ENV_UI" = "0" ] && _UI_PREF="cli"
 
 case "$_UI_PREF" in
     cli)
@@ -2070,11 +2075,37 @@ cmd_clone() {
 # ── REMOVE ────────────────────────────────────────────────────────────────────
 
 cmd_remove() {
-    _alias="$1"
-    [ -z "$_alias" ] && die "Usage: okssh rm <alias>"
+    # Non-interactive mode (used by sshop's delete modal):
+    #   okssh rm <alias> --yes [--keys|--keep-keys]
+    # --yes skips all prompts; --keys also deletes the key pair
+    # (default without --keys is to keep the key files).
+    _alias=""; _rm_yes=0; _rm_keys=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --yes|-y)    _rm_yes=1 ;;
+            --keys)      _rm_keys="yes" ;;
+            --keep-keys) _rm_keys="no" ;;
+            --*)         die "Unknown flag: '$1'  (use: --yes, --keys, --keep-keys)" ;;
+            *)           _alias="$1" ;;
+        esac
+        shift
+    done
+    [ -z "$_alias" ] && die "Usage: okssh rm <alias> [--yes] [--keys|--keep-keys]"
     alias_exists "$_alias" || die "Alias \"$_alias\" not found."
     _key=$(get_field "$_alias" "IdentityFile")
     _host=$(get_field "$_alias" "HostName")
+
+    if [ "$_rm_yes" -eq 1 ]; then
+        remove_config_block "$_alias"
+        if [ "$_rm_keys" = "yes" ] && [ -n "$_key" ] && [ -f "$_key" ]; then
+            rm -f "$_key" "${_key}.pub"
+            vlog "Deleted key files: $_key"
+        fi
+        sync_auto_export
+        sync_keys_update
+        printf 'ok: %s\n' "$_alias"
+        return 0
+    fi
 
     printf '\n'
     warn "About to remove alias \"${C_BOLD}$_alias${C_RESET}\" → $_host"
@@ -2088,7 +2119,12 @@ cmd_remove() {
     success "Alias \"$_alias\" removed."
 
     if [ -n "$_key" ] && [ -f "$_key" ]; then
-        if wt_yesno "Also delete key files?\n  $_key\n  ${_key}.pub"; then
+        _rm_del="$_rm_keys"
+        if [ -z "$_rm_del" ]; then
+            wt_yesno "Also delete key files?\n  $_key\n  ${_key}.pub" \
+                && _rm_del="yes" || _rm_del="no"
+        fi
+        if [ "$_rm_del" = "yes" ]; then
             rm -f "$_key" "${_key}.pub"
             success "Key files deleted."
         else
@@ -5909,6 +5945,7 @@ cmd_help() {
     printf "    %-36s %s\n" "okssh [-v] edit <alias>"       "Edit an alias"
     printf "    %-36s %s\n" "okssh [-v] rotate <alias>"     "Rotate SSH key"
     printf "    %-36s %s\n" "okssh [-v] rm <alias>"         "Remove alias (+ optional key delete)"
+    printf "    %-36s %s\n" "okssh [-v] rm <alias> --yes [--keys]" "Non-interactive remove (--keys deletes key pair)"
     printf "    %-36s %s\n" "okssh [-v] export [file]"      "Export aliases to portable file"
     printf "    %-36s %s\n" "okssh [-v] import <file>"      "Import aliases from export file"
     printf "    %-36s %s\n" "okssh [-v] run <alias> <cmd>"  "Run a one-off remote command"
@@ -6009,7 +6046,7 @@ case "${1:-}" in
     test)              cmd_test   "${2:-}" ;;
     edit)              cmd_edit   "${2:-}" ;;
     rotate)            cmd_rotate "${2:-}" ;;
-    rm|remove)         cmd_remove "${2:-}" ;;
+    rm|remove)         shift; cmd_remove "$@" ;;
     export)            cmd_export "${2:-}" ;;
     import)            cmd_import "${2:-}" ;;
     prefer)            cmd_prefer "${2:-}" "${3:-}" "${4:-}" ;;
