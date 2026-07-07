@@ -2294,8 +2294,30 @@ cmd_rotate() {
             || warn "Could not auto-remove old key — remove manually from remote authorized_keys."
     fi
 
-    mv "$_new_key" "$_old_key"
-    mv "${_new_key}.pub" "${_old_key}.pub"
+    # If the key follows the id_<type>_<alias> convention and the type
+    # changed, rename to match — otherwise audits, badges and humans keep
+    # reading the wrong type from the filename.
+    _final_key="$_old_key"
+    case "$(basename "$_old_key")" in
+        id_*_"$_alias")
+            _final_key="$SSH_DIR/id_${_new_type}_${_alias}" ;;
+    esac
+    mv "$_new_key" "$_final_key"
+    mv "${_new_key}.pub" "${_final_key}.pub"
+    if [ "$_final_key" != "$_old_key" ]; then
+        rm -f "$_old_key" "${_old_key}.pub"
+        # rewrite the config block so IdentityFile points at the new name
+        _rj=$(get_field   "$_alias" "ProxyJump")
+        _rn=$(get_comment "$_alias" "Note")
+        _rg=$(get_comment "$_alias" "Group")
+        _ra=$(get_field   "$_alias" "ServerAliveInterval")
+        _rf=$(get_field   "$_alias" "ForwardAgent")
+        _rl=$(get_field   "$_alias" "LocalForward")
+        remove_config_block "$_alias"
+        write_config_block "$_alias" "$_host" "$_user" "$_port" \
+            "$_final_key" "$_rj" "$_rn" "$_ra" "$_rf" "$_rl" "$_rg"
+        info "Key renamed: $(basename "$_old_key") → $(basename "$_final_key")"
+    fi
     success "Key files updated locally."
 
     sync_auto_export
@@ -4212,8 +4234,16 @@ cmd_connect() {
 
     # Ephemeral profile mode: inject init files, connect with modified shell startup
     if [ "$_use_profile" -eq 1 ]; then
+        _conn_start=$(date +%s 2>/dev/null || printf '0')
+        set +e
         _connect_with_profile "$_alias"
-        return $?
+        _ssh_exit=$?
+        set -e
+        _conn_end=$(date +%s 2>/dev/null || printf '0')
+        printf '%s|%s|%s|%s\n' \
+            "$(date '+%Y-%m-%d %H:%M')" "$_alias" "$(( _conn_end - _conn_start ))" "$_ssh_exit" \
+            >> "$HISTORY_LOG" 2>/dev/null || true
+        return "$_ssh_exit"
     fi
 
     # Auto-add key to agent if requested
