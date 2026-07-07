@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # okssh — SSH alias & connection manager
 # POSIX sh compatible (bash & zsh safe)
-# Version 3.9.1
+# Version 3.10.0
 #
 # USAGE:
 #   okssh [-v]                              Interactive TUI/CLI menu
@@ -18,7 +18,7 @@
 #   okssh [-v] import-key                   Register a private key sent to you (no keygen)
 #   okssh [-v] run    <alias> <cmd>         Run a one-off remote command
 #   okssh [-v] copy   <src>   <dst>         Copy files via sftp (alias:/path)
-#   okssh [-v] status                       Test all connections (dashboard)
+#   okssh [-v] status [--json]              Test all connections (dashboard)
 #   okssh [-v] audit                        Audit SSH key ages
 #   okssh       prefer [whiptail|cli]       Show or set preferences
 #   okssh       prefer audit_threshold <N>  Key rotation threshold (days)
@@ -66,7 +66,7 @@
 # FLAGS:
 #   -v | --verbose    Show background operations normally run silently
 
-OKSSH_VERSION="3.9.1"
+OKSSH_VERSION="3.10.0"
 
 set -e
 
@@ -3689,6 +3689,12 @@ cmd_snip_push() {
 
 # ── Whiptail display wrappers ─────────────────────────────────────────────────
 
+# Minimal JSON string escaping (backslash + double quote; our data has no
+# control chars — aliases are sanitized, hosts/timestamps are plain)
+_json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 # Strip ANSI color codes from a string (POSIX-portable via actual ESC char)
 _strip_colors() {
     _sc_esc=$(printf '\033')
@@ -4457,9 +4463,21 @@ cmd_untag() {
 # ── STATUS DASHBOARD ──────────────────────────────────────────────────────────
 
 cmd_status() {
+    # --json: machine-readable output for frontends (sshop) — no spinner,
+    # no colors, full-SSH reachability with per-alias latency.
+    _st_json=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in --json|-j) _st_json=1 ;; esac
+        shift
+    done
     _aliases=$(list_aliases)
     if [ -z "$_aliases" ]; then
-        printf '\n  No aliases configured. Add one with: okssh add\n\n'; return 0
+        if [ "$_st_json" -eq 1 ]; then
+            printf '[]\n'
+        else
+            printf '\n  No aliases configured. Add one with: okssh add\n\n'
+        fi
+        return 0
     fi
     _timeout=8
     _tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t okssh)
@@ -4484,6 +4502,32 @@ cmd_status() {
     done <<_EOST
 $(printf '%s\n' "$_aliases")
 _EOST
+
+    if [ "$_st_json" -eq 1 ]; then
+        wait
+        printf '['
+        _st_first=1
+        while IFS= read -r _a; do
+            [ -z "$_a" ] && continue
+            _h=$(get_field "$_a" "HostName")
+            _last=$(pref_get "last_connect_$_a")
+            _res=""; [ -f "$_tmpdir/$_a" ] && _res=$(cat "$_tmpdir/$_a")
+            case "$_res" in
+                ok:*) _st_reach=true;  _st_ms=${_res#ok:} ;;
+                *)    _st_reach=false; _st_ms=null ;;
+            esac
+            [ "$_st_first" -eq 0 ] && printf ','
+            _st_first=0
+            printf '\n  {"alias":"%s","host":"%s","reachable":%s,"latency_ms":%s,"last_connect":"%s"}' \
+                "$(_json_escape "$_a")" "$(_json_escape "$_h")" \
+                "$_st_reach" "$_st_ms" "$(_json_escape "$_last")"
+        done <<_EOSJ
+$(printf '%s\n' "$_aliases")
+_EOSJ
+        printf '\n]\n'
+        rm -rf "$_tmpdir"
+        return 0
+    fi
 
     # Spinner while probes run
     printf '\n'
@@ -5958,6 +6002,7 @@ cmd_help() {
     printf "    %-36s %s\n" "okssh [-v] run <alias> <cmd>"  "Run a one-off remote command"
     printf "    %-36s %s\n" "okssh [-v] copy <src> <dst>"   "Copy files via sftp (alias:/path)"
     printf "    %-36s %s\n" "okssh [-v] status"             "Test all connections (dashboard)"
+    printf "    %-36s %s\n" "okssh [-v] status --json"      "Machine-readable status (for frontends)"
     printf "    %-36s %s\n" "okssh [-v] audit"              "Audit SSH key ages"
     printf "    %-36s %s\n" "okssh       prefer"            "Show current preferences"
     printf "    %-36s %s\n" "okssh       prefer whiptail"   "Use TUI (installs if needed)"
@@ -6059,7 +6104,7 @@ case "${1:-}" in
     prefer)            cmd_prefer "${2:-}" "${3:-}" "${4:-}" ;;
     run)               _run_alias="${2:-}"; shift 2 2>/dev/null || true; cmd_run "$_run_alias" "$@" ;;
     copy)              shift; cmd_copy "${1:-}" "${2:-}" ;;
-    status)            cmd_status ;;
+    status)            shift; cmd_status "$@" ;;
     audit)             cmd_audit ;;
     snip|snippets)     shift; cmd_snip "$@" ;;
     sync)              cmd_sync   "${2:-}" "${3:-}" ;;
