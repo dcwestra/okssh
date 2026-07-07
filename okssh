@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # okssh — SSH alias & connection manager
 # POSIX sh compatible (bash & zsh safe)
-# Version 3.9.0
+# Version 3.9.1
 #
 # USAGE:
 #   okssh [-v]                              Interactive TUI/CLI menu
@@ -66,7 +66,7 @@
 # FLAGS:
 #   -v | --verbose    Show background operations normally run silently
 
-OKSSH_VERSION="3.9.0"
+OKSSH_VERSION="3.9.1"
 
 set -e
 
@@ -858,15 +858,19 @@ _bootstrap_remove() {
 
 _bootstrap_list() {
     printf "\n  ${C_LBLUE}${C_BOLD}Aliases with snippet widget installed${C_RESET}\n\n"
-    _bfound=0
-    awk '/^Host / && !/[*?]/ {print $2}' "$CONFIG_FILE" 2>/dev/null | \
+    # Build rows in a substitution — a piped while loop runs in a subshell,
+    # so a flag set inside it would never reach this shell.
+    _brows=$(awk '/^Host / && !/[*?]/ {print $2}' "$CONFIG_FILE" 2>/dev/null | \
     while IFS= read -r _ba; do
-        _bdate=$(pref_get "bootstrap_$_ba" "")
+        _bdate=$(pref_get "bootstrap_$_ba")
         [ -z "$_bdate" ] && continue
         printf "  ${C_BOLD}%-28s${C_RESET}  %s\n" "$_ba" "$_bdate"
-        _bfound=1
-    done
-    [ "$_bfound" -eq 0 ] && printf '  (none)\n'
+    done)
+    if [ -n "$_brows" ]; then
+        printf '%s\n' "$_brows"
+    else
+        printf '  (none)\n'
+    fi
     printf '\n'
 }
 
@@ -1201,6 +1205,7 @@ cmd_add() {
     # add <alias> <host> <user> <port> <key_spec> <password> [note] [group] [jump] [alive] [fwdagent] [localfwd]
     # key_spec: ed25519|rsa|ecdsa  → generate new key + ssh-copy-id with <password>
     #           import:/path/key   → copy existing key, skip ssh-copy-id
+    # password: literal, or "@env" to read from $OKSSH_PASSWORD (keeps it out of `ps`)
     if [ "$#" -ge 5 ]; then
         ALIAS=$(sanitize_alias "$1")
         REMOTE_HOST="$2"
@@ -1215,9 +1220,11 @@ cmd_add() {
         ADV_FWDAGENT="${11:-}"
         ADV_LOCALFWD="${12:-}"
 
+        [ "$REMOTE_PASS" = "@env" ] && REMOTE_PASS="${OKSSH_PASSWORD:-}"
         [ -z "$ALIAS" ]       && die "Alias cannot be empty"
         [ -z "$REMOTE_HOST" ] && die "Host cannot be empty"
         [ -z "$REMOTE_USER" ] && die "User cannot be empty"
+        alias_exists "$ALIAS" && die "Alias '$ALIAS' already exists — remove it first or pick another name"
         case "$REMOTE_PORT" in ''|*[!0-9]*) REMOTE_PORT=22 ;; esac
 
         mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
@@ -1499,6 +1506,7 @@ cmd_import_key() {
         [ ! -f "$IK_SRC" ]  && die "Key file not found: $IK_SRC"
         [ -z "$IK_HOST" ]   && die "Host cannot be empty"
         [ -z "$IK_USER" ]   && die "User cannot be empty"
+        alias_exists "$IK_ALIAS" && die "Alias '$IK_ALIAS' already exists — remove it first or pick another name"
         case "$IK_PORT" in ''|*[!0-9]*) IK_PORT=22 ;; esac
         IK_TYPE=$(_detect_key_type "$IK_SRC")
         mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
@@ -2432,7 +2440,7 @@ _cmd_prefer_alias() {
                 # Normalise MAC to lowercase colon-separated
                 _wm_norm=$(printf '%s' "$_wm" | tr '[:upper:]' '[:lower:]' | \
                     sed 's/-/:/g' | sed 's/[^0-9a-f:]//g')
-                _wm_octets=$(printf '%s' "$_wm_norm" | tr ':' '\n' | wc -l)
+                _wm_octets=$(printf '%s' "$_wm_norm" | awk -F':' '{print NF}')
                 [ "$_wm_octets" -ne 6 ] 2>/dev/null && die "Invalid MAC address: $_wm"
                 pref_set "wol_mac_${_pa}" "$_wm_norm"
                 success "WOL MAC set for \"$_pa\": $_wm_norm"
