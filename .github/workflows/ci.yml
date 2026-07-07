@@ -14,7 +14,14 @@ jobs:
         run: |
           sh -n okssh
           bash -n okssh
-          sh -n okssh-completion || true
-          bash -n okssh-completion
+      # okssh-completion is a dual bash+zsh file, so `bash -n` (which parses
+      # the whole file, zsh block included) can never pass. Sourcing it is
+      # the real contract: bash stops reading at the dialect guard.
+      - name: Completion sources cleanly under bash
+        run: bash -c '. ./okssh-completion && complete -p okssh'
+      - name: Completion sources cleanly under zsh
+        run: |
+          sudo apt-get install -y -q zsh >/dev/null
+          zsh -c '. ./okssh-completion'
       - name: shellcheck
         run: shellcheck okssh

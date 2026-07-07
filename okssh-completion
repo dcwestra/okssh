@@ -192,6 +192,13 @@ complete -F _okssh_complete okssh
 
 fi  # end bash
 
+# Everything below is zsh-only. Stop here under bash so its parser never
+# reads the zsh syntax — bash parses sourced files incrementally, and
+# without this it errors on the zsh block even though it never runs it.
+if [ -n "${BASH_VERSION:-}" ]; then
+    return 0 2>/dev/null || true
+fi
+
 # ── Zsh completion ────────────────────────────────────────────────────────────
 
 if [ -n "${ZSH_VERSION:-}" ]; then
@@ -428,6 +435,10 @@ _okssh() {
     esac
 }
 
-compdef _okssh okssh
+# compdef only exists once compinit has run — don't error when sourced early
+# (also the file's last command: must not leave a non-zero return code)
+if command -v compdef >/dev/null 2>&1; then
+    compdef _okssh okssh
+fi
 
 fi  # end zsh
