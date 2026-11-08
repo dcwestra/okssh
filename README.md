@@ -26,6 +26,7 @@ Works as a full TUI (whiptail menus) or a plain CLI. One shell script, no compil
 - **Sync** — mirror aliases, snippets, and preferences to any mounted folder (NAS, cloud drive, USB)
 - **Encrypted key sync** — opt-in AES-256 archive of private keys, passphrase never stored
 - **Export / import** — portable plaintext format for moving aliases between machines
+- **Plain output when piped** — colours only on a terminal; `NO_COLOR=1` turns them off, `CLICOLOR_FORCE=1` forces them
 - **Interactive TUI** via whiptail/newt, with automatic fallback to CLI prompts
 - **Tab completion** for bash and zsh — source `okssh-completion`
 - **Bootstrap** — deploy a snippet widget (`Ctrl+X s`) to any remote host so your saved snippets are available as a fuzzy-searchable command palette in the remote shell (zsh ZLE + bash readline); persistent install or ephemeral `--profile` sessions
@@ -113,7 +114,8 @@ okssh edit <alias>               # Edit any saved field
 okssh rm <alias>                 # Remove alias and optionally delete its key
 okssh test <alias>               # Test connectivity (non-interactive)
 okssh rotate <alias>             # Rotate the SSH key for an alias
-okssh export [file]              # Export aliases to a portable file
+okssh export [file]              # Export aliases to a portable file (- = stdout)
+okssh export --ansible [file]    # Ansible INI inventory (groups = okssh groups)
 okssh import <file>              # Import aliases from an export file
 ```
 

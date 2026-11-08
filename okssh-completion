@@ -44,7 +44,7 @@ _okssh_complete() {
     cur="${words[$cword]}"
     prev="${words[$((cword - 1))]}"
 
-    local main_cmds="add connect ls list info test edit rotate rm remove clone rename tag untag pin unpin export import prefer run copy open wake status audit tunnel agent snip sync backup bootstrap log diff template version help"
+    local main_cmds="add import-key connect ls list info test edit rotate rm remove clone rename tag untag pin unpin export import prefer run copy open wake status audit tunnel agent snip sync backup bootstrap log diff template version help"
     local snip_subcmds="list ls add run info edit rm remove"
     local sync_subcmds="status init detach keys"
     local keys_subcmds="status enable disable update restore"
@@ -65,10 +65,19 @@ _okssh_complete() {
         2)
             case "$subcmd" in
                 connect)
-                    COMPREPLY=($(compgen -W "$(_okssh_aliases) --agent --sshpass" -- "$cur"))
+                    COMPREPLY=($(compgen -W "$(_okssh_aliases) --agent --sshpass --profile -P" -- "$cur"))
                     return 0 ;;
                 info|test|edit|rotate|rm|remove)
                     COMPREPLY=($(compgen -W "$(_okssh_aliases)" -- "$cur"))
+                    return 0 ;;
+                status)
+                    COMPREPLY=($(compgen -W "--json" -- "$cur"))
+                    return 0 ;;
+                export)
+                    COMPREPLY=($(compgen -W "--ansible -" -- "$cur") $(compgen -f -- "$cur"))
+                    return 0 ;;
+                import|import-key)
+                    COMPREPLY=($(compgen -f -- "$cur"))
                     return 0 ;;
                 run)
                     COMPREPLY=($(compgen -W "$(_okssh_aliases)" -- "$cur"))
@@ -95,7 +104,13 @@ _okssh_complete() {
         3)
             case "$subcmd" in
                 connect)
-                    COMPREPLY=($(compgen -W "--agent --sshpass" -- "$cur"))
+                    COMPREPLY=($(compgen -W "--agent --sshpass --profile -P" -- "$cur"))
+                    return 0 ;;
+                rm|remove)
+                    COMPREPLY=($(compgen -W "--yes --keys --keep-keys" -- "$cur"))
+                    return 0 ;;
+                export)
+                    COMPREPLY=($(compgen -W "-" -- "$cur") $(compgen -f -- "$cur"))
                     return 0 ;;
                 ls|list)
                     # After --group/-g, complete group names
@@ -155,6 +170,9 @@ _okssh_complete() {
             esac ;;
         4)
             case "$subcmd" in
+                rm|remove)
+                    COMPREPLY=($(compgen -W "--yes --keys --keep-keys" -- "$cur"))
+                    return 0 ;;
                 snip|snippets)
                     local snip_sub="${words[$((2 + offset))]}"
                     case "$snip_sub" in
@@ -209,6 +227,7 @@ _okssh() {
     local -a main_cmds
     main_cmds=(
         'add:Add a new SSH alias'
+        'import-key:Register a private key someone sent you'
         'connect:Connect to a saved alias'
         'ls:List all aliases'
         'list:List all aliases'
@@ -218,7 +237,7 @@ _okssh() {
         'rotate:Rotate SSH key for an alias'
         'rm:Remove alias (+ optional key delete)'
         'remove:Remove alias'
-        'export:Export aliases to portable file'
+        'export:Export aliases (portable file, --ansible inventory, - for stdout)'
         'import:Import aliases from export file'
         'prefer:Show or set preferences'
         'run:Run a one-off remote command'
@@ -318,13 +337,34 @@ _okssh() {
                         _describe 'alias' aliases
                     else
                         _arguments '--agent[Auto-add key to ssh-agent]' \
-                                   '--sshpass[Use stored/prompted password]'
+                                   '--sshpass[Use stored/prompted password]' \
+                                   '(-P --profile)'{-P,--profile}'[Ephemeral session with snippet profile]'
                     fi
                     ;;
-                info|test|edit|rotate|rm|remove)
+                info|test|edit|rotate)
                     local -a aliases
                     aliases=(${(f)"$(_okssh_aliases)"})
                     _describe 'alias' aliases
+                    ;;
+                rm|remove)
+                    if (( CURRENT == 3 )); then
+                        local -a aliases
+                        aliases=(${(f)"$(_okssh_aliases)"})
+                        _describe 'alias' aliases
+                    else
+                        _arguments '--yes[Skip all prompts]' \
+                                   '(--keep-keys)--keys[Also delete the key pair]' \
+                                   '(--keys)--keep-keys[Keep the key pair (default)]'
+                    fi
+                    ;;
+                status)
+                    _arguments '--json[Machine-readable output for frontends]'
+                    ;;
+                export)
+                    _arguments '--ansible[Ansible INI inventory]' '*:file:_files'
+                    ;;
+                import|import-key)
+                    _files
                     ;;
                 run)
                     if (( CURRENT == 3 )); then

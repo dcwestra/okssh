@@ -24,4 +24,10 @@ jobs:
           sudo apt-get install -y -q zsh >/dev/null
           zsh -c '. ./okssh-completion'
       - name: shellcheck
-        run: shellcheck okssh
+        run: shellcheck okssh tests/okssh_test.sh
+      # okssh runs under dash on Debian/Ubuntu (/bin/sh) and bash elsewhere —
+      # the regression suite runs it under both
+      - name: Regression tests (dash)
+        run: OKSSH_SH=dash sh tests/okssh_test.sh
+      - name: Regression tests (bash)
+        run: OKSSH_SH=bash sh tests/okssh_test.sh

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # okssh — SSH alias & connection manager
 # POSIX sh compatible (bash & zsh safe)
-# Version 3.10.0
+# Version 3.11.0
 #
 # USAGE:
 #   okssh [-v]                              Interactive TUI/CLI menu
@@ -13,7 +13,7 @@
 #   okssh [-v] rm     <alias> [--yes] [--keys|--keep-keys]  Remove an alias
 #   okssh [-v] test   [alias]               Test one alias, or all if no alias given
 #   okssh [-v] rotate <alias>               Rotate SSH key for an alias
-#   okssh [-v] export [file]                Export aliases to a portable file
+#   okssh [-v] export [--ansible] [file|-]  Export aliases (portable file or Ansible inventory; - = stdout)
 #   okssh [-v] import <file>                Import aliases from export file
 #   okssh [-v] import-key                   Register a private key sent to you (no keygen)
 #   okssh [-v] run    <alias> <cmd>         Run a one-off remote command
@@ -66,7 +66,7 @@
 # FLAGS:
 #   -v | --verbose    Show background operations normally run silently
 
-OKSSH_VERSION="3.10.0"
+OKSSH_VERSION="3.11.0"
 
 set -e
 
@@ -93,7 +93,7 @@ CONF_DIR="$HOME/.config/okssh"
 PREF_FILE="$CONF_DIR/preferences"
 
 if [ -f "$PREF_FILE" ]; then
-    _old_sync=$(awk -F'=' '/^sync_path=/{print $2}' "$PREF_FILE")
+    _old_sync=$(sed -n 's/^sync_path=//p' "$PREF_FILE" | head -n 1)
     if [ -n "$_old_sync" ] && [ "${_old_sync##*/}" = "termio-sync" ]; then
         _new_sync="${_old_sync%/termio-sync}/okssh-sync"
         if [ -d "$_old_sync" ] && [ ! -d "$_new_sync" ]; then
@@ -106,7 +106,11 @@ if [ -f "$PREF_FILE" ]; then
 fi
 
 _snip_migrate_file="$CONF_DIR/snippets"
-if [ -f "$_snip_migrate_file" ] && grep -q '^\[snippet\]' "$_snip_migrate_file" 2>/dev/null; then
+# The old format is "[snippet]" blocks with cmd= fields. Checking for cmd= too
+# keeps a current-format snippet that happens to be NAMED "snippet" from being
+# "migrated" (= deleted) on every run.
+if [ -f "$_snip_migrate_file" ] && grep -q '^\[snippet\]' "$_snip_migrate_file" 2>/dev/null \
+        && grep -q '^cmd=' "$_snip_migrate_file" 2>/dev/null; then
     awk '
         /^\[snippet\]/ { in_s=1; sn=""; sd=""; sc=""; ss=""; sk=""; next }
         in_s && /^name=/     { sn=substr($0,6); next }
@@ -131,17 +135,31 @@ unset _snip_migrate_file
 # Whiptail/newt color theme — dark background, cyan accents, matches CLI palette
 export NEWT_COLORS='root=white,black:border=cyan,black:window=white,black:shadow=black,black:title=cyan,black:button=black,cyan:actbutton=black,brightcyan:checkbox=white,black:actcheckbox=black,cyan:entry=white,black:label=cyan,black:listbox=white,black:actlistbox=white,black:textbox=white,black:acttextbox=white,black:helpline=black,black:roottext=cyan,black:sellistbox=white,black:actsellistbox=black,cyan'
 
-C_RESET='\033[0m'
-C_BOLD='\033[1m'
-C_DIM='\033[2m'
-C_CYAN='\033[0;36m'
-C_GREEN='\033[0;32m'
-C_YELLOW='\033[0;33m'
-C_RED='\033[0;31m'
-C_MAGENTA='\033[0;35m'
-C_WHITE='\033[0;37m'
-C_ORANGE='\033[38;5;214m'   # warm amber — accent colour
-C_LBLUE='\033[38;5;39m'     # bright sky-blue — primary chrome
+# Colours only when stdout is a terminal, so captured output (sshop, pipes,
+# files) is plain text that frontends can parse. NO_COLOR (no-color.org)
+# always wins; CLICOLOR_FORCE=1 forces colours for a capturing caller that
+# renders ANSI itself (sshop's output popups).
+_okssh_use_color() {
+    if [ -n "${NO_COLOR:-}" ]; then return 1; fi
+    if [ -n "${CLICOLOR_FORCE:-}" ] && [ "$CLICOLOR_FORCE" != "0" ]; then return 0; fi
+    [ -t 1 ]
+}
+if _okssh_use_color; then
+    C_RESET='\033[0m'
+    C_BOLD='\033[1m'
+    C_DIM='\033[2m'
+    C_CYAN='\033[0;36m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_RED='\033[0;31m'
+    C_MAGENTA='\033[0;35m'
+    C_WHITE='\033[0;37m'
+    C_ORANGE='\033[38;5;214m'   # warm amber — accent colour
+    C_LBLUE='\033[38;5;39m'     # bright sky-blue — primary chrome
+else
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_CYAN=''; C_GREEN=''; C_YELLOW=''
+    C_RED=''; C_MAGENTA=''; C_WHITE=''; C_ORANGE=''; C_LBLUE=''
+fi
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 
@@ -168,7 +186,7 @@ _base64_decode() {
 _rel_time() {
     _rt_ts="$1"
     [ -z "$_rt_ts" ] && { printf 'never'; return; }
-    _rt_now=$(date +%s)
+    _rt_now="${_NOW:-$(date +%s)}"
     _rt_then=$(_ts_to_epoch "$_rt_ts") || { printf '%s' "$_rt_ts" | cut -c1-10; return; }
     _rt_diff=$(( _rt_now - _rt_then ))
     if   [ "$_rt_diff" -lt 3600 ];    then printf 'just now'
@@ -242,24 +260,38 @@ print_banner() {
 
 # ── Preferences ───────────────────────────────────────────────────────────────
 
+# Preferences are "key=value" lines. Keys match on the exact "key=" prefix
+# (no regex), and values are everything after the first "=" — so values may
+# contain "=" (base64 padding, paths) and keys may contain "." safely.
 pref_get() {
-    [ -f "$PREF_FILE" ] || { printf ''; return; }
-    awk -F'=' -v k="$1" '$1 == k { print $2; exit }' "$PREF_FILE"
+    [ -f "$PREF_FILE" ] || return 0
+    awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$PREF_FILE"
 }
 
 pref_set() {
     mkdir -p "$CONF_DIR"
-    touch "$PREF_FILE"; chmod 600 "$PREF_FILE"
-    if grep -q "^$1=" "$PREF_FILE" 2>/dev/null; then
-        awk -F'=' -v k="$1" -v v="$2" \
-            'BEGIN{OFS="="} $1==k{$2=v} {print}' \
-            "$PREF_FILE" > "${PREF_FILE}.tmp" \
-            && mv "${PREF_FILE}.tmp" "$PREF_FILE"
-    else
-        printf '%s=%s\n' "$1" "$2" >> "$PREF_FILE"
-    fi
-    vlog "pref_set: $1=$2 → $PREF_FILE"
+    touch "$PREF_FILE"
+    # value via ENVIRON, not -v: awk -v would interpret backslash escapes
+    _PS_VAL="$2" awk -v k="$1" '
+        BEGIN { v = ENVIRON["_PS_VAL"]; done = 0 }
+        index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next }
+        { print }
+        END { if (!done) print k "=" v }
+    ' "$PREF_FILE" > "${PREF_FILE}.tmp" && mv "${PREF_FILE}.tmp" "$PREF_FILE"
+    chmod 600 "$PREF_FILE"   # after mv — the temp file was created with the umask
+    vlog "pref_set: $1 → $PREF_FILE"
 }
+
+pref_del() {
+    [ -f "$PREF_FILE" ] || return 0
+    awk -v k="$1" 'index($0, k "=") != 1' "$PREF_FILE" > "${PREF_FILE}.tmp" \
+        && mv "${PREF_FILE}.tmp" "$PREF_FILE"
+    chmod 600 "$PREF_FILE"
+}
+
+# Per-alias preference prefixes ("<prefix>_<alias>") — rename moves them,
+# rm deletes them. Keep in sync with every pref_set "<prefix>_$alias" call.
+_ALIAS_PREF_KEYS="last_connect auto_agent sshpass wol_mac copy_last_remote audit_threshold bootstrap"
 
 # ── Distro detection ──────────────────────────────────────────────────────────
 
@@ -414,11 +446,15 @@ cli_prompt() {
     else
         printf "  ${C_BOLD}%s${C_RESET}: " "$_label"
     fi
+    # if/fi, not "[ -z … ] && …": as the function's last command a false
+    # test made cli_prompt return 1, and under set -e every TYPED answer
+    # (blank ones were fine) killed okssh mid-wizard — edit, clone, snip add…
     if IFS= read -r _PROMPT_RESULT; then
-        [ -z "$_PROMPT_RESULT" ] && _PROMPT_RESULT="$_default"
+        if [ -z "$_PROMPT_RESULT" ]; then _PROMPT_RESULT="$_default"; fi
     else
         _PROMPT_RESULT=""; _PROMPT_CANCELLED=1
     fi
+    return 0
 }
 
 cli_prompt_secret() {
@@ -454,14 +490,26 @@ wt_password() {
     fi
 }
 
+# wt_yesno <question> [y|n] — default answer for Enter / the focused button
+# (default n in the CLI; whiptail's own default, Yes, unless "n" is given)
 wt_yesno() {
     if [ "$HAS_WHIPTAIL" -eq 1 ]; then
-        whiptail --yesno "$1" 10 64 \
-            --title "okssh" --backtitle "okssh v${OKSSH_VERSION}" \
-            3>&1 1>&2 2>&3
+        if [ "${2:-}" = "n" ]; then
+            whiptail --yesno "$1" 10 64 --defaultno \
+                --title "okssh" --backtitle "okssh v${OKSSH_VERSION}" \
+                3>&1 1>&2 2>&3
+        else
+            whiptail --yesno "$1" 10 64 \
+                --title "okssh" --backtitle "okssh v${OKSSH_VERSION}" \
+                3>&1 1>&2 2>&3
+        fi
         return $?
     else
-        cli_prompt "$1 (y/N)" "N"
+        if [ "${2:-}" = "y" ]; then
+            cli_prompt "$1 (Y/n)" "Y"
+        else
+            cli_prompt "$1 (y/N)" "N"
+        fi
         case "$_PROMPT_RESULT" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
     fi
 }
@@ -492,35 +540,261 @@ _warn_ssh_includes() {
     printf "  Hosts in included files are visible to ssh but not to okssh ls/status/audit.\n\n"
 }
 
-get_field() {
-    [ -f "$CONFIG_FILE" ] || { printf ''; return; }
-    awk -v a="$1" -v f="$2" '
-        /^Host /                              { in_block = ($2 == a); next }
-        in_block && tolower($1) == tolower(f) { print $2; exit }
-    ' "$CONFIG_FILE"
+# Shared awk functions for reading ~/.ssh/config lines. Prepended to the awk
+# programs below so every reader agrees on the syntax:
+#   kw(line)       directive keyword, lowercased ("" for comments/blank lines)
+#   kval(line)     directive value — EVERYTHING after the keyword, so
+#                  multi-word values ("LocalForward 8080 localhost:80") and
+#                  "Key=value" / "Key = value" forms survive intact
+#   cval(line, k)  value of a "# k: value" metadata comment ("" if not k)
+#   blockstart()   1 on a line that starts a new Host/Match block
+_CFG_AWK='
+function kw(line,   l) {
+    l = line; sub(/^[ \t]+/, "", l)
+    if (l == "" || substr(l, 1, 1) == "#") return ""
+    match(l, /^[^ \t=]+/); return tolower(substr(l, 1, RLENGTH))
 }
+function kval(line,   l) {
+    l = line; sub(/^[ \t]+/, "", l); match(l, /^[^ \t=]+/)
+    l = substr(l, RLENGTH + 1); sub(/^[ \t]*=?[ \t]*/, "", l); sub(/[ \t\r]+$/, "", l)
+    return l
+}
+function cval(line, k,   l) {
+    l = line; if (l !~ /^[ \t]*#/) return ""
+    sub(/^[ \t]*#[ \t]*/, "", l)
+    if (index(l, k ":") != 1) return ""
+    l = substr(l, length(k) + 2); sub(/^[ \t]+/, "", l); sub(/[ \t\r]+$/, "", l)
+    return l
+}
+function blockstart(line) { return line ~ /^(Host|Match)[ \t]/ }
+function expand_home(p) {
+    if (substr(p, 1, 2) == "~/") return ENVIRON["HOME"] substr(p, 2)
+    return p
+}
+'
 
-get_comment() {
-    [ -f "$CONFIG_FILE" ] || { printf ''; return; }
-    awk -v a="$1" -v k="$2" '
-        /^Host /                     { in_block = ($2 == a); next }
-        in_block && /^[[:space:]]*#/ {
-            line = $0
-            sub(/^[[:space:]]*# */, "", line)
-            split(line, parts, ": ")
-            if (parts[1] == k) { print parts[2]; exit }
+get_field() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    awk -v a="$1" -v f="$2" "$_CFG_AWK"'
+        blockstart($0) { in_block = ($1 == "Host" && $2 == a); next }
+        in_block && kw($0) == tolower(f) {
+            v = kval($0); if (tolower(f) == "identityfile") v = expand_home(v)
+            print v; exit
         }
     ' "$CONFIG_FILE"
 }
 
+get_comment() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    awk -v a="$1" -v k="$2" "$_CFG_AWK"'
+        blockstart($0) { in_block = ($1 == "Host" && $2 == a); next }
+        in_block && cval($0, k) != "" { print cval($0, k); exit }
+    ' "$CONFIG_FILE"
+}
+
+# Rewrite $CONFIG_FILE through an awk program (stdin → tmp → mv), keeping 600.
+_cfg_rewrite() {
+    awk "$@" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+        && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
 remove_config_block() {
     backup_config
-    awk -v a="$1" '
-        /^Host / { in_block = ($2 == a) }
+    _cfg_rewrite -v a="$1" "$_CFG_AWK"'
+        blockstart($0) { in_block = ($1 == "Host" && $2 == a) }
         !in_block { print }
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
-        && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    '
     vlog "Removed config block: $1"
+}
+
+# ── In-place block editing ────────────────────────────────────────────────────
+# Edits touch only the lines they change: every other directive and comment
+# in the block (RemoteForward, SetEnv, extra LocalForwards, hand-written
+# options…) is preserved, and the block keeps its position in the file.
+# Callers take the backup (backup_config) before their first edit.
+
+# _block_set <alias> <Keyword> <value>
+#   Replaces the first <Keyword> line; appends it at the end of the block if
+#   absent. An empty value deletes every <Keyword> line in the block.
+# _block_set_comment <alias> <Name> <value>
+#   Same for "# Name: value" metadata; new comments join the comment run
+#   right after the Host line (where write_config_block puts them).
+_block_set()         { _block_edit "$1" dir     "$2" "$3"; }
+_block_set_comment() { _block_edit "$1" comment "$2" "$3"; }
+
+_block_edit() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    # exported explicitly: an assignment prefixed to a *function* call isn't
+    # reliably passed to the awk inside it (POSIX leaves that unspecified)
+    _BE_VAL="$4"; export _BE_VAL
+    _cfg_rewrite -v a="$1" -v mode="$2" -v key="$3" "$_CFG_AWK"'
+        function hit(line) {
+            if (mode == "dir") return kw(line) == tolower(key)
+            return cval(line, key) != "" || line ~ ("^[ \t]*#[ \t]*" key ":[ \t]*$")
+        }
+        function newline() {
+            if (mode == "dir") return "    " key " " val
+            return "    # " key ": " val
+        }
+        function flush(   i, found, last, cend) {
+            if (!n) return
+            found = 0
+            for (i = 2; i <= n; i++) if (hit(buf[i])) { found = 1; break }
+            last = n; while (last > 1 && buf[last] ~ /^[ \t]*$/) last--
+            cend = 1; while (cend < n && buf[cend + 1] ~ /^[ \t]*#/) cend++
+            done = 0
+            for (i = 1; i <= n; i++) {
+                if (i > 1 && hit(buf[i])) {
+                    if (val != "" && !done) { print newline(); done = 1 }
+                    else if (val != "") print buf[i]   # keep later duplicates
+                    continue
+                }
+                print buf[i]
+                if (!found && val != "") {
+                    if (mode == "comment" && i == cend) print newline()
+                    if (mode == "dir" && i == last) print newline()
+                }
+            }
+            n = 0
+        }
+        BEGIN { val = ENVIRON["_BE_VAL"]; n = 0 }
+        blockstart($0) { flush(); if ($1 == "Host" && $2 == a) { buf[++n] = $0; next } }
+        n { buf[++n] = $0; next }
+        { print }
+        END { flush() }
+    '
+    unset _BE_VAL
+}
+
+# _block_rename <old> <new> — change the Host line, nothing else
+_block_rename() {
+    _cfg_rewrite -v a="$1" -v b="$2" '
+        $1 == "Host" && $2 == a && NF == 2 { print "Host " b; next }
+        { print }
+    '
+}
+
+# _block_copy <src> <new> — append a copy of <src>'s block named <new>
+_block_copy() {
+    _bc_block=$(awk -v a="$1" -v b="$2" "$_CFG_AWK"'
+        blockstart($0) { in_block = ($1 == "Host" && $2 == a); if (in_block) { print "Host " b; next } }
+        in_block { print }
+    ' "$CONFIG_FILE" | awk '{ l[NR] = $0 } END { n = NR; while (n > 0 && l[n] ~ /^[ \t]*$/) n--; for (i = 1; i <= n; i++) print l[i] }')
+    [ -s "$CONFIG_FILE" ] && printf '\n' >> "$CONFIG_FILE"
+    printf '%s\n' "$_bc_block" >> "$CONFIG_FILE"
+}
+
+# _jump_refs_rename <old> <new> — rewrite other blocks' ProxyJump chains and
+# "# JumpAlias:" comments that name <old> (whole comma-separated hops only)
+_jump_refs_rename() {
+    _cfg_rewrite -v a="$1" -v b="$2" "$_CFG_AWK"'
+        function swap(list,   n, i, parts, out) {
+            n = split(list, parts, ",")
+            out = ""
+            for (i = 1; i <= n; i++) {
+                if (parts[i] == a) parts[i] = b
+                out = out (i > 1 ? "," : "") parts[i]
+            }
+            return out
+        }
+        kw($0) == "proxyjump" {
+            v = kval($0); nv = swap(v)
+            if (nv != v) { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "ProxyJump " nv; next }
+        }
+        cval($0, "JumpAlias") != "" {
+            v = cval($0, "JumpAlias"); nv = swap(v)
+            if (nv != v) { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "# JumpAlias: " nv; next }
+        }
+        { print }
+    '
+}
+
+# ── Single-pass alias table ───────────────────────────────────────────────────
+# One awk pass over preferences + ~/.ssh/config, one record per alias, fields
+# separated by \037 (unit separator — IFS whitespace would merge empty fields):
+#   1 alias  2 host  3 user  4 port  5 key  6 jump  7 alive  8 fwdagent
+#   9 localfwd  10 note  11 group  12 last_connect  13 audit_threshold_<alias>
+#   14 pinned(0/1)  15 group colour index (0-5, "" = no group)  16 key in agent(0/1)
+# $1 (optional): newline-separated agent key blobs (`ssh-add -L | awk '{print $2}'`)
+# for column 16. Replaces ~10 processes and full-file scans *per alias*.
+_US=$(printf '\037')
+_alias_table() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    _at_prefs="$PREF_FILE"; [ -f "$_at_prefs" ] || _at_prefs=/dev/null
+    _AT_BLOBS="${1:-}" awk -v US="$_US" "$_CFG_AWK"'
+        function gcolor(g,   s, i, chars) {
+            if (g == "") return ""
+            chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+            s = 0; for (i = 1; i <= length(g); i++) s += index(chars, substr(g, i, 1))
+            return s % 6
+        }
+        function emit(   loaded, line, p) {
+            if (name == "" || name == "*") return
+            loaded = 0
+            if (f["identityfile"] != "" && nblobs) {
+                if ((getline line < (f["identityfile"] ".pub")) > 0) {
+                    split(line, p, " "); if (p[2] in blobs) loaded = 1
+                }
+                close(f["identityfile"] ".pub")
+            }
+            print name US f["hostname"] US f["user"] US f["port"] US f["identityfile"] US \
+                  f["proxyjump"] US f["serveraliveinterval"] US f["forwardagent"] US \
+                  f["localforward"] US c["Note"] US c["Group"] US \
+                  prefs["last_connect_" name] US prefs["audit_threshold_" name] US \
+                  ((name in pinned) ? 1 : 0) US gcolor(c["Group"]) US loaded
+        }
+        function reset() { split("", f); split("", c); name = "" }
+        BEGIN {
+            nblobs = split(ENVIRON["_AT_BLOBS"], b, "\n")
+            for (i = 1; i <= nblobs; i++) if (b[i] != "") blobs[b[i]] = 1
+        }
+        FILENAME == ARGV[1] {
+            p = index($0, "="); if (p > 1) prefs[substr($0, 1, p - 1)] = substr($0, p + 1)
+            next
+        }
+        FNR == 1 {
+            np = split(prefs["pinned_aliases"], pl, ",")
+            for (i = 1; i <= np; i++) if (pl[i] != "") pinned[pl[i]] = 1
+            reset()
+        }
+        blockstart($0) { emit(); reset(); if ($1 == "Host") name = $2; next }
+        name != "" {
+            k = kw($0)
+            if (k != "") { if (!(k in f)) { f[k] = kval($0); if (k == "identityfile") f[k] = expand_home(f[k]) } }
+            else {
+                if (!("Note" in c)  && cval($0, "Note")  != "") c["Note"]  = cval($0, "Note")
+                if (!("Group" in c) && cval($0, "Group") != "") c["Group"] = cval($0, "Group")
+            }
+        }
+        END { emit() }
+    ' "$_at_prefs" "$CONFIG_FILE"
+}
+
+# _alias_cols <n>... — just the listed _alias_table columns (by number above),
+# still \037-separated; readers name only the fields they use instead of
+# counting positional placeholders. Set _AC_BLOBS to fill column 16.
+_alias_cols() {
+    _alias_table "${_AC_BLOBS:-}" | awk -F "$_US" -v OFS="$_US" -v spec="$*" '
+        BEGIN { n = split(spec, c, " ") }
+        { line = $(c[1]); for (i = 2; i <= n; i++) line = line OFS $(c[i]); print line }'
+}
+
+# Colour / badge lookups that set a variable instead of printing — called per
+# table row, where a $(…) subshell each would cost a fork.
+_set_group_color() {
+    case "$1" in
+        0) _GC="$C_LBLUE" ;; 1) _GC="$C_GREEN" ;; 2) _GC="$C_YELLOW" ;;
+        3) _GC="$C_MAGENTA" ;; 4) _GC="$C_ORANGE" ;; 5) _GC="$C_CYAN" ;;
+        *) _GC="$C_DIM" ;;
+    esac
+}
+_set_key_badge() {
+    case "$1" in
+        *id_rsa_*)   _KB='[rsa]' ;;
+        *id_ecdsa_*) _KB='[ec] ' ;;
+        *)           _KB='[ed] ' ;;
+    esac
 }
 
 sanitize_alias() {
@@ -531,7 +805,7 @@ sanitize_alias() {
 }
 
 alias_exists() {
-    grep -q "^Host $1$" "$CONFIG_FILE" 2>/dev/null
+    [ -n "$1" ] && grep -qxF -- "Host $1" "$CONFIG_FILE" 2>/dev/null
 }
 
 # ── Config backup ─────────────────────────────────────────────────────────────
@@ -541,11 +815,22 @@ HISTORY_LOG="$CONF_DIR/history.log"
 TEMPLATE_FILE="$CONF_DIR/templates"
 BACKUP_MAX=5
 
+# One snapshot per okssh run, taken before its first change — the state you
+# would want to restore. Multi-step rewrites (remove + write, or several
+# in-place edits) used to snapshot every step, and same-second names
+# overwrote each other, leaving only an intermediate state without the alias.
 backup_config() {
     [ -f "$CONFIG_FILE" ] || return 0
+    [ -n "${_OKSSH_BACKED_UP:-}" ] && return 0
+    _OKSSH_BACKED_UP=1
     mkdir -p "$BACKUP_DIR"
     _bc_stamp=$(date '+%Y%m%d-%H%M%S')
-    cp "$CONFIG_FILE" "$BACKUP_DIR/config.${_bc_stamp}"
+    _bc_target="$BACKUP_DIR/config.${_bc_stamp}"
+    _bc_n=1
+    while [ -e "$_bc_target" ]; do
+        _bc_n=$(( _bc_n + 1 )); _bc_target="$BACKUP_DIR/config.${_bc_stamp}-${_bc_n}"
+    done
+    cp "$CONFIG_FILE" "$_bc_target"; chmod 600 "$_bc_target"
     # Prune oldest beyond BACKUP_MAX
     _bc_count=$(ls "$BACKUP_DIR"/config.* 2>/dev/null | wc -l)
     if [ "$_bc_count" -gt "$BACKUP_MAX" ]; then
@@ -553,7 +838,7 @@ backup_config() {
             | tail -n "+$(( BACKUP_MAX + 1 ))" \
             | while IFS= read -r _f; do rm -f "$_f"; done
     fi
-    vlog "Backed up SSH config → $BACKUP_DIR/config.${_bc_stamp}"
+    vlog "Backed up SSH config → $_bc_target"
 }
 
 cmd_backup() {
@@ -605,9 +890,18 @@ cmd_backup() {
 # ── bootstrap ──────────────────────────────────────────────────────────────────
 # Generates the shell profile content deployed to remote hosts.
 # Uses single quotes throughout to avoid variable expansion at definition time.
+# Separator between the two files streamed to the remote in one ssh call
+# (profile first, then the snippet list) — see _bootstrap_push_all.
+_OKSSH_SNIP_SEP='__OKSSH_SNIPPETS__'
+
 _okssh_profile_content() {
     cat << 'PROFILE_END'
 # okssh shell profile — sourced by .zshrc / .bashrc
+# fzf installed without sudo (okssh bootstrap → git) lives in ~/.fzf/bin
+case ":$PATH:" in
+    *":$HOME/.fzf/bin:"*) ;;
+    *) [ -d "$HOME/.fzf/bin" ] && PATH="$HOME/.fzf/bin:$PATH" ;;
+esac
 # Snippet fuzzy-insert: Ctrl+X s  (requires fzf on remote)
 _okssh_snip() {
     _tsf="$HOME/.config/okssh/snippet-list.txt"
@@ -641,15 +935,36 @@ fi
 PROFILE_END
 }
 
+# One round trip: is fzf there, which package manager, is git available, and
+# the login shell. Prints "<yes|no> <pm|-> <yes|no> <shell>"; empty output
+# means the host could not be reached.
+_bootstrap_probe() {
+    ssh -n -F "$CONFIG_FILE" "$1" '
+        command -v fzf >/dev/null 2>&1 && f=yes || f=no
+        pm=-
+        for p in apt-get dnf yum pacman brew apk zypper; do
+            if command -v "$p" >/dev/null 2>&1; then pm=$p; break; fi
+        done
+        command -v git >/dev/null 2>&1 && g=yes || g=no
+        printf "%s %s %s %s\n" "$f" "$pm" "$g" "${SHELL:-/bin/sh}"
+    ' 2>/dev/null || true
+}
+
 # Check for fzf on remote and offer to install it if missing.
-# Sets _fzf_path_prefix to a PATH prefix line if installed via git (no sudo).
+# Also sets _BCD_SHELL to the remote login shell (same probe round trip).
 _bootstrap_check_deps() {
     _bcd_alias="$1"
-    _fzf_path_prefix=""
+    _BCD_SHELL=""
 
     printf '  Checking dependencies on %s…\n' "$_bcd_alias"
-    _fzf_ok=$(ssh -F "$CONFIG_FILE" "$_bcd_alias" \
-        'command -v fzf >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
+    _bcd_probe=$(_bootstrap_probe "$_bcd_alias")
+    if [ -z "$_bcd_probe" ]; then
+        warn "Could not reach $_bcd_alias to check dependencies."
+        return 0
+    fi
+    # shellcheck disable=SC2086  # split the four probe words on purpose
+    set -- $_bcd_probe
+    _fzf_ok="$1"; _bcd_pm="$2"; _bcd_git="$3"; _BCD_SHELL="${4:-}"
 
     if [ "$_fzf_ok" = "yes" ]; then
         printf "  ${C_GREEN}✓${C_RESET} fzf found\n"
@@ -657,13 +972,6 @@ _bootstrap_check_deps() {
     fi
 
     printf "  ${C_YELLOW}⚠${C_RESET} fzf not found — required for the snippet widget\n"
-
-    # Detect package manager on remote
-    _bcd_pm=$(ssh -F "$CONFIG_FILE" "$_bcd_alias" '
-        for _p in apt-get dnf yum pacman brew apk zypper; do
-            command -v "$_p" >/dev/null 2>&1 && printf "%s" "$_p" && exit 0
-        done
-    ' 2>/dev/null)
 
     # Build package-manager install command
     _bcd_pm_cmd=""
@@ -676,10 +984,6 @@ _bootstrap_check_deps() {
         apk)         _bcd_pm_cmd="sudo apk add --no-cache fzf" ;;
         zypper)      _bcd_pm_cmd="sudo zypper install -y fzf" ;;
     esac
-
-    # Check if git is available for no-sudo fallback
-    _bcd_git=$(ssh -F "$CONFIG_FILE" "$_bcd_alias" \
-        'command -v git >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
 
     printf '\n'
     if [ -n "$_bcd_pm_cmd" ]; then
@@ -700,8 +1004,9 @@ _bootstrap_check_deps() {
                 warn "No supported package manager detected."; return 0
             fi
             printf '  Running: %s\n\n' "$_bcd_pm_cmd"
+            # shellcheck disable=SC2029  # the install command is meant to expand locally
             ssh -t -F "$CONFIG_FILE" "$_bcd_alias" "$_bcd_pm_cmd"
-            _fzf_ok2=$(ssh -F "$CONFIG_FILE" "$_bcd_alias" \
+            _fzf_ok2=$(ssh -n -F "$CONFIG_FILE" "$_bcd_alias" \
                 'command -v fzf >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
             if [ "$_fzf_ok2" = "yes" ]; then
                 success "fzf installed on $_bcd_alias"
@@ -717,12 +1022,11 @@ _bootstrap_check_deps() {
             ssh -t -F "$CONFIG_FILE" "$_bcd_alias" \
                 'git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf 2>&1 \
                  && ~/.fzf/install --bin --no-update-rc 2>&1'
-            _fzf_ok3=$(ssh -F "$CONFIG_FILE" "$_bcd_alias" \
+            _fzf_ok3=$(ssh -n -F "$CONFIG_FILE" "$_bcd_alias" \
                 'test -x ~/.fzf/bin/fzf && echo yes || echo no' 2>/dev/null)
             if [ "$_fzf_ok3" = "yes" ]; then
+                # the profile itself puts ~/.fzf/bin on PATH
                 success "fzf installed to ~/.fzf/bin on $_bcd_alias"
-                # Profile needs to add ~/.fzf/bin to PATH
-                _fzf_path_prefix='[ -d "$HOME/.fzf/bin" ] && export PATH="$HOME/.fzf/bin:$PATH"'
             else
                 warn "fzf git install may have failed — verify manually on $_bcd_alias"
             fi
@@ -761,8 +1065,7 @@ cmd_bootstrap() {
         --update|-u|update)
             [ -z "$_bal" ] && die "Usage: okssh bootstrap update <alias>"
             alias_exists "$_bal" || die "Alias '$_bal' not found"
-            _bootstrap_push_snips "$_bal" || die "Failed to push snippets to $_bal"
-            _bootstrap_upgrade_profile "$_bal"
+            _bootstrap_push_all "$_bal" || die "Failed to update bootstrap on $_bal"
             success "Bootstrap updated on $_bal"; return 0 ;;
         "")
             die "Usage: okssh bootstrap <alias> | list | update <alias> | remove <alias>" ;;
@@ -774,60 +1077,53 @@ cmd_bootstrap() {
     esac
 }
 
+# Push shell-init.sh + the snippet list and wire the source line into
+# ~/.zshrc / ~/.bashrc (migrating old termio lines) — all in ONE round trip:
+# both files travel over stdin, split at $_OKSSH_SNIP_SEP. Used by install
+# and update, so update keeps everything install set up.
+_bootstrap_push_all() {
+    {
+        _okssh_profile_content
+        printf '%s\n' "$_OKSSH_SNIP_SEP"
+        _okssh_snip_list_content
+    } | ssh -F "$CONFIG_FILE" "$1" '
+        d="$HOME/.config/okssh"
+        mkdir -p "$d" || exit 1
+        f="$d/shell-init.sh"; s="$d/snippet-list.txt"
+        : > "$f.tmp" && : > "$s.tmp" || exit 1
+        out="$f.tmp"
+        while IFS= read -r l || [ -n "$l" ]; do
+            if [ "$l" = "__OKSSH_SNIPPETS__" ]; then out="$s.tmp"; continue; fi
+            printf "%s\n" "$l" >> "$out"
+        done
+        mv "$f.tmp" "$f" && mv "$s.tmp" "$s" && chmod 600 "$f" || exit 1
+        [ -d "$HOME/.config/termio" ] && cp "$s" "$HOME/.config/termio/snippet-list.txt" 2>/dev/null
+        _sl="[ -f \"$HOME/.config/okssh/shell-init.sh\" ] && . \"$HOME/.config/okssh/shell-init.sh\""
+        for _sf in "$HOME/.zshrc" "$HOME/.bashrc"; do
+            [ -f "$_sf" ] || continue
+            if grep -q "termio/shell-init" "$_sf" 2>/dev/null; then
+                sed -i "/^# termio profile$/d; /termio\/shell-init\.sh/d" "$_sf" 2>/dev/null \
+                    || sed -i "" "/^# termio profile$/d; /termio\/shell-init\.sh/d" "$_sf" 2>/dev/null || true
+            fi
+            grep -qF "okssh/shell-init.sh" "$_sf" 2>/dev/null && continue
+            printf "\n# okssh profile\n%s\n" "$_sl" >> "$_sf"
+            printf "  wired into %s\n" "$_sf"
+        done
+        exit 0
+    '
+}
+
 _bootstrap_install() {
     _bia="$1"
     info "Installing snippet widget on ${C_BOLD}$_bia${C_RESET}…"
     printf '\n'
 
     # Check / install dependencies (|| true: dep failures are advisory, not fatal)
-    _fzf_path_prefix=""
     _bootstrap_check_deps "$_bia" || true
-
-    # Push profile script (prepend PATH fix if fzf was git-installed)
-    {
-        [ -n "$_fzf_path_prefix" ] && printf '%s\n' "$_fzf_path_prefix"
-        _okssh_profile_content
-    } | ssh -F "$CONFIG_FILE" "$_bia" \
-        'mkdir -p ~/.config/okssh && cat > ~/.config/okssh/shell-init.sh && chmod 600 ~/.config/okssh/shell-init.sh' \
-        || die "Failed to copy profile to $_bia"
-    # Push snippet list
-    _bootstrap_push_snips "$_bia" || true
-    # Add source guard to .zshrc and .bashrc (idempotent)
-    ssh -F "$CONFIG_FILE" "$_bia" '
-        _sl="[ -f \"$HOME/.config/okssh/shell-init.sh\" ] && . \"$HOME/.config/okssh/shell-init.sh\""
-        for _sf in ~/.zshrc ~/.bashrc; do
-            [ -f "$_sf" ] || continue
-            grep -qF "okssh/shell-init.sh" "$_sf" 2>/dev/null && continue
-            printf "\n# okssh profile\n%s\n" "$_sl" >> "$_sf"
-            printf "  appended to %s\n" "$_sf"
-        done
-    ' || true
+    _bootstrap_push_all "$_bia" || die "Failed to install the profile on $_bia"
     pref_set "bootstrap_$_bia" "$(date '+%Y-%m-%d')"
     success "Snippet widget installed on $_bia — active from next login (or: source ~/.zshrc)"
     printf '\n'
-}
-
-_bootstrap_upgrade_profile() {
-    _bup_a="$1"
-    # Push current shell-init.sh (idempotent for fresh installs; migrates termio→okssh on old ones)
-    _okssh_profile_content | ssh -F "$CONFIG_FILE" "$_bup_a" \
-        'mkdir -p ~/.config/okssh && cat > ~/.config/okssh/shell-init.sh && chmod 600 ~/.config/okssh/shell-init.sh' \
-        || { warn "Could not update shell-init.sh on $_bup_a"; return 1; }
-    # Migrate shell config files from termio → okssh source line (idempotent)
-    ssh -F "$CONFIG_FILE" "$_bup_a" '
-        _sl="[ -f \"$HOME/.config/okssh/shell-init.sh\" ] && . \"$HOME/.config/okssh/shell-init.sh\""
-        for _sf in ~/.zshrc ~/.bashrc; do
-            [ -f "$_sf" ] || continue
-            grep -qF "okssh/shell-init.sh" "$_sf" 2>/dev/null && continue
-            # Remove old termio source block if present
-            sed -i "/^# termio profile$/d" "$_sf" 2>/dev/null || \
-                sed -i "" "/^# termio profile$/d" "$_sf" 2>/dev/null || true
-            sed -i "/termio\/shell-init\.sh/d" "$_sf" 2>/dev/null || \
-                sed -i "" "/termio\/shell-init\.sh/d" "$_sf" 2>/dev/null || true
-            printf "\n# okssh profile\n%s\n" "$_sl" >> "$_sf"
-            printf "  migrated %s\n" "$_sf"
-        done
-    ' || true
 }
 
 _bootstrap_push_snips() {
@@ -843,22 +1139,23 @@ _bootstrap_push_snips() {
 _bootstrap_remove() {
     _bra="$1"
     info "Removing snippet widget from ${C_BOLD}$_bra${C_RESET}…"
-    ssh -F "$CONFIG_FILE" "$_bra" '
+    ssh -n -F "$CONFIG_FILE" "$_bra" '
         rm -f ~/.config/okssh/shell-init.sh ~/.config/okssh/snippet-list.txt
         for _sf in ~/.zshrc ~/.bashrc; do
             [ -f "$_sf" ] || continue
             grep -qF "okssh/shell-init.sh" "$_sf" 2>/dev/null || continue
             # Remove "# okssh profile\n<source line>" block
             # (double quotes here — nesting single quotes inside this
-            # single-quoted remote script would break the quoting)
-            sed -i "/^# okssh profile\$/{N;d}" "$_sf" 2>/dev/null || \
-            sed -i"" "/^# okssh profile\$/{N;d}" "$_sf" 2>/dev/null || true
+            # single-quoted remote script would break the quoting; the BSD
+            # fallback needs the empty suffix as its own argument)
+            sed -i "/^# okssh profile\$/{N;d;}" "$_sf" 2>/dev/null || \
+            sed -i "" "/^# okssh profile\$/{N;d;}" "$_sf" 2>/dev/null || true
             sed -i "/okssh\/shell-init.sh/d" "$_sf" 2>/dev/null || \
-            sed -i"" "/okssh\/shell-init.sh/d" "$_sf" 2>/dev/null || true
+            sed -i "" "/okssh\/shell-init.sh/d" "$_sf" 2>/dev/null || true
             printf "  cleaned %s\n" "$_sf"
         done
     '
-    pref_set "bootstrap_$_bra" ""
+    pref_del "bootstrap_$_bra"
     success "Snippet widget removed from $_bra"
     printf '\n'
 }
@@ -884,54 +1181,63 @@ _bootstrap_list() {
 _bootstrap_list_names() {
     awk '/^Host / && !/[*?]/ {print $2}' "$CONFIG_FILE" 2>/dev/null | \
     while IFS= read -r _bln; do
-        [ -n "$(pref_get "bootstrap_$_bln" "")" ] && printf '%s\n' "$_bln"
+        if [ -n "$(pref_get "bootstrap_$_bln")" ]; then printf '%s\n' "$_bln"; fi
     done
+    # (an "[ … ] && printf" body made this return 1 whenever the LAST alias
+    # wasn't bootstrapped — and `x=$(_bootstrap_list_names)` then exited
+    # under set -e)
 }
 
 # Ephemeral per-session profile injection.  Called from cmd_connect with --profile.
 _connect_with_profile() {
     _cpa="$1"   # alias
-    _tag="t$$"
-    _tdir="/tmp/._okssh_${_tag}"
 
     info "Preparing session profile for ${C_BOLD}$_cpa${C_RESET}…"
     printf '\n'
 
-    # Check deps — offer install if fzf missing
-    _fzf_path_prefix=""
+    # Check deps — offer install if fzf missing (also learns the login shell)
     _bootstrap_check_deps "$_cpa"
 
-    # Push profile + snippets in two non-interactive connections
-    {
-        [ -n "$_fzf_path_prefix" ] && printf '%s\n' "$_fzf_path_prefix"
+    # Stage profile + snippets in a private remote temp dir — mktemp, not a
+    # guessable /tmp name another user on a shared host could pre-create — and
+    # build both shell rc variants, all in one round trip. Prints the dir.
+    _tdir=$({
         _okssh_profile_content
-    } | ssh -F "$CONFIG_FILE" "$_cpa" \
-        "mkdir -p '${_tdir}' ~/.config/okssh && cat > '${_tdir}/profile.sh'" \
-        || die "Could not push profile to $_cpa"
-    _okssh_snip_list_content | ssh -F "$CONFIG_FILE" "$_cpa" \
-        "cat > '${_tdir}/snips.txt' && cp '${_tdir}/snips.txt' ~/.config/okssh/snippet-list.txt"
-
-    # Detect remote login shell
-    _cpsh=$(ssh -F "$CONFIG_FILE" "$_cpa" 'printf "%s" "$SHELL"' 2>/dev/null)
+        printf '%s\n' "$_OKSSH_SNIP_SEP"
+        _okssh_snip_list_content
+    } | ssh -F "$CONFIG_FILE" "$_cpa" '
+        d=$(mktemp -d 2>/dev/null || mktemp -d -t okssh) || exit 1
+        out="$d/profile.sh"; : > "$out"; : > "$d/snips.txt"
+        while IFS= read -r l || [ -n "$l" ]; do
+            if [ "$l" = "__OKSSH_SNIPPETS__" ]; then out="$d/snips.txt"; continue; fi
+            printf "%s\n" "$l" >> "$out"
+        done
+        mkdir -p "$HOME/.config/okssh" && cp "$d/snips.txt" "$HOME/.config/okssh/snippet-list.txt"
+        mkdir -p "$d/zd"
+        { printf "%s\n" "[ -f \"\$HOME/.zshrc\" ] && . \"\$HOME/.zshrc\" 2>/dev/null"
+          cat "$d/profile.sh"; } > "$d/zd/.zshrc"
+        { printf "%s\n" "[ -f \"\$HOME/.bashrc\" ] && . \"\$HOME/.bashrc\" 2>/dev/null"
+          cat "$d/profile.sh"; } > "$d/rc.sh"
+        printf "%s\n" "$d"
+    ') || die "Could not stage the session profile on $_cpa"
+    # the path is interpolated into the next remote command — accept only a
+    # plain absolute path
+    case "$_tdir" in
+        /*[!A-Za-z0-9._/-]*|"") die "Unexpected staging path from $_cpa: $_tdir" ;;
+        /*) : ;;
+        *) die "Unexpected staging path from $_cpa: $_tdir" ;;
+    esac
 
     sleep 0.2
     clear 2>/dev/null || printf '\033[2J\033[H'
     set +e
-    case "$_cpsh" in
+    # shellcheck disable=SC2029  # the staging path is meant to expand locally
+    case "$_BCD_SHELL" in
         */zsh)
-            ssh -F "$CONFIG_FILE" "$_cpa" "
-                mkdir -p '${_tdir}/zd'
-                { printf '%s\n' '[ -f \"\$HOME/.zshrc\" ] && . \"\$HOME/.zshrc\" 2>/dev/null'
-                  cat '${_tdir}/profile.sh'; } > '${_tdir}/zd/.zshrc'
-            "
             ssh -t -F "$CONFIG_FILE" "$_cpa" \
                 "ZDOTDIR='${_tdir}/zd' zsh -i; rm -rf '${_tdir}'"
             ;;
         *)
-            ssh -F "$CONFIG_FILE" "$_cpa" "
-                { printf '%s\n' '[ -f \"\$HOME/.bashrc\" ] && . \"\$HOME/.bashrc\" 2>/dev/null'
-                  cat '${_tdir}/profile.sh'; } > '${_tdir}/rc.sh'
-            "
             ssh -t -F "$CONFIG_FILE" "$_cpa" \
                 "bash --rcfile '${_tdir}/rc.sh' -i; rm -rf '${_tdir}'"
             ;;
@@ -985,36 +1291,11 @@ sync_auto_export() {
     }
     _export_file="$_sync_path/aliases-export.txt"
     vlog "sync_auto_export: writing $_export_file"
-    _aliases=$(list_aliases)
     {
         printf '# okssh aliases export — auto-updated\n'
         printf '# version %s — %s\n' "$OKSSH_VERSION" "$(date)"
         printf '# Import with: okssh import <file>\n\n'
-
-        printf '%s\n' "$_aliases" | while IFS= read -r _alias; do
-            [ -z "$_alias" ] && continue
-            _host=$(get_field   "$_alias" "HostName")
-            _user=$(get_field   "$_alias" "User")
-            _port=$(get_field   "$_alias" "Port"); [ -z "$_port" ] && _port="22"
-            _jump=$(get_field   "$_alias" "ProxyJump")
-            _alive=$(get_field  "$_alias" "ServerAliveInterval")
-            _fwda=$(get_field   "$_alias" "ForwardAgent")
-            _lfwd=$(get_field   "$_alias" "LocalForward")
-            _note=$(get_comment "$_alias" "Note")
-            _grp=$(get_comment  "$_alias" "Group")
-            printf '[alias]\n'
-            printf 'name=%s\n'     "$_alias"
-            printf 'hostname=%s\n' "$_host"
-            printf 'user=%s\n'     "$_user"
-            printf 'port=%s\n'     "$_port"
-            [ -n "$_note"  ] && printf 'note=%s\n'      "$_note"
-            [ -n "$_grp"   ] && printf 'group=%s\n'     "$_grp"
-            [ -n "$_jump"  ] && printf 'jump=%s\n'      "$_jump"
-            [ -n "$_alive" ] && printf 'keepalive=%s\n' "$_alive"
-            [ -n "$_fwda"  ] && printf 'fwdagent=%s\n'  "$_fwda"
-            [ -n "$_lfwd"  ] && printf 'localfwd=%s\n'  "$_lfwd"
-            printf '\n'
-        done
+        _export_body
     } > "$_export_file" 2>/dev/null || {
         warn "Auto-export to sync folder failed."
         return 0
@@ -1712,65 +1993,57 @@ cmd_list() {
         shift
     done
     _warn_ssh_includes
-    _aliases=$(list_aliases)
-    if [ -z "$_aliases" ]; then
+
+    # Agent key blobs once for the whole table (compared against each alias's
+    # .pub inside the single awk pass — no ssh-keygen per alias)
+    _agent_blobs=$(ssh-add -L 2>/dev/null | awk '{print $2}' || true)
+    _rows=$(_alias_table "$_agent_blobs")
+    if [ -z "$_rows" ]; then
         printf '\n  No aliases found in %s\n\n' "$CONFIG_FILE"; return 0
     fi
-    # Filter: skip "hidden" unless --all; apply group filter
-    _aliases=$(printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-        [ -z "$_a" ] && continue
-        _ag=$(get_comment "$_a" "Group")
-        if [ "$_show_all" -eq 0 ]; then
-            printf '%s' "$_ag" | tr ',' '\n' | tr -d ' ' | grep -qx "hidden" && continue
-        fi
-        if [ -n "$_filter_group" ]; then
-            printf '%s' "$_ag" | tr ',' '\n' | tr -d ' ' | grep -qx "$_filter_group" \
-                || continue
-        fi
-        printf '%s\n' "$_a"
-    done)
 
-    # Sorting
+    # Filter (hidden unless --all; --group) and order — one awk over the rows
     _pinned=$(pref_get "pinned_aliases")
-    case "${_sort_mode:-}" in
-        alpha)
-            _aliases=$(printf '%s\n' "$_aliases" | sort) ;;
-        recent)
-            # Sort by last_connect timestamp descending (most recent first)
-            _aliases=$(printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-                [ -z "$_a" ] && continue
-                _lc=$(pref_get "last_connect_${_a}")
-                printf '%s\t%s\n' "${_lc:-0000-00-00}" "$_a"
-            done | sort -r | awk -F'\t' '{print $2}') ;;
-        group)
-            _aliases=$(printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-                [ -z "$_a" ] && continue
-                _ag=$(get_comment "$_a" "Group")
-                printf '%s\t%s\n' "${_ag:--}" "$_a"
-            done | sort | awk -F'\t' '{print $2}') ;;
-        *)
-            # Default: pinned aliases first (in pin order), then rest
-            if [ -n "$_pinned" ]; then
-                _pinned_list=$(printf '%s' "$_pinned" | tr ',' '\n' | while IFS= read -r _p; do
-                    [ -z "$_p" ] && continue
-                    printf '%s\n' "$_aliases" | grep -x "$_p" || true
-                done)
-                _unpinned=$(printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-                    [ -z "$_a" ] && continue
-                    printf '%s,' "$_pinned" | tr ',' '\n' | grep -qx "$_a" || printf '%s\n' "$_a"
-                done)
-                _aliases=$(printf '%s\n%s' "$_pinned_list" "$_unpinned" | grep -v '^$' || true)
-            fi ;;
-    esac
-    if [ -z "$_aliases" ]; then
+    _rows=$(printf '%s\n' "$_rows" | awk -F "$_US" -v all="$_show_all" -v g="$_filter_group" \
+            -v mode="${_sort_mode:-}" -v pins="$_pinned" '
+        function ingroup(list, want,   n, i, parts, x) {
+            n = split(list, parts, ",")
+            for (i = 1; i <= n; i++) { x = parts[i]; gsub(/[ \t]/, "", x); if (x == want) return 1 }
+            return 0
+        }
+        {
+            if (!all && ingroup($11, "hidden")) next
+            if (g != "" && !ingroup($11, g)) next
+            n++; row[n] = $0; name[n] = $1
+            if (mode == "alpha")       key[n] = $1
+            else if (mode == "recent") key[n] = ($12 == "" ? "0000-00-00" : $12)
+            else if (mode == "group")  key[n] = ($11 == "" ? "-" : $11) SUBSEP $1
+            else                       key[n] = sprintf("%09d", n)
+        }
+        END {
+            # default order: pinned first (in pin order), then config order
+            if (mode == "") {
+                np = split(pins, pl, ",")
+                for (i = 1; i <= np; i++) pinpos[pl[i]] = i
+                for (i = 1; i <= n; i++)
+                    key[i] = ((name[i] in pinpos) ? sprintf("0%05d", pinpos[name[i]]) : "1") sprintf("%09d", i)
+            }
+            # insertion sort — alias lists are small; "recent" sorts descending
+            for (i = 2; i <= n; i++) {
+                r = row[i]; k = key[i]; j = i - 1
+                while (j > 0 && (mode == "recent" ? key[j] < k : key[j] > k)) {
+                    row[j + 1] = row[j]; key[j + 1] = key[j]; j--
+                }
+                row[j + 1] = r; key[j + 1] = k
+            }
+            for (i = 1; i <= n; i++) print row[i]
+        }')
+    if [ -z "$_rows" ]; then
         [ -n "$_filter_group" ] && \
             printf '\n  No aliases in group "%s".\n\n' "$_filter_group" || \
             printf '\n  No aliases found.\n\n'
         return 0
     fi
-
-    # Collect agent fingerprints once for the whole table
-    _agent_fps=$(ssh-add -l 2>/dev/null | awk '{print $2}' || true)
 
     # Box widths (chars between │ borders, including 1 space each side):
     #   W1=24: │ alias(16) space badge(5) │
@@ -1789,39 +2062,24 @@ cmd_list() {
         "ALIAS" "TYPE" "HOSTNAME" "GROUP" "LAST"
     _ls_hline "  ├" "┼" "┤" "$_W1" "$_W2" "$_W3" "$_W4"
 
-    printf '%s\n' "$_aliases" | while IFS= read -r _alias; do
+    _NOW=$(date +%s)   # read by _rel_time — one clock call for the whole table
+    printf '%s\n' "$_rows" | while IFS="$_US" read -r _alias _host _u _p _key _j _al _fa _lf _n _grp _last _at _is_pinned _gci _loaded; do
         [ -z "$_alias" ] && continue
-        _host=$(get_field  "$_alias" "HostName")
-        _key=$(get_field   "$_alias" "IdentityFile")
-        _grp=$(get_comment "$_alias" "Group")
-        _last=$(pref_get "last_connect_${_alias}")
-
-        _badge=$(_key_badge "$_key")
+        _set_key_badge "$_key"
+        _set_group_color "$_gci"
         _relts=$(_rel_time "$_last")
-        _grp_disp=$(printf '%.12s' "${_grp:--}")
-        _grp_col=$(_group_color "$_grp")
+        _grp_disp="${_grp:--}"
 
         # Pinned indicator: '*' suffix on alias (1 char), alias truncated to 15
-        _is_pinned=0
-        printf '%s,' "$_pinned" | tr ',' '\n' | grep -qx "$_alias" 2>/dev/null \
-            && _is_pinned=1
-        if [ "$_is_pinned" -eq 1 ]; then
-            _alias_field=$(printf '%-15.15s*' "$_alias")
-        else
-            _alias_field=$(printf '%-15.15s ' "$_alias")
-        fi
+        _pin_mark=" "; [ "$_is_pinned" = "1" ] && _pin_mark="*"
 
-        # Check if key is loaded in ssh-agent (use bold if so)
-        _acol="${_grp_col}"
-        if [ -n "$_key" ] && [ -f "$_key" ] && [ -n "$_agent_fps" ]; then
-            _kfp=$(ssh-keygen -lf "$_key" 2>/dev/null | awk '{print $2}')
-            printf '%s\n' "$_agent_fps" | grep -qF "$_kfp" 2>/dev/null \
-                && _acol="${C_BOLD}${C_WHITE}"
-        fi
+        # Bold white if the alias's key is loaded in ssh-agent
+        _acol="$_GC"
+        [ "$_loaded" = "1" ] && _acol="${C_BOLD}${C_WHITE}"
 
         # All args to %-Ns are plain strings (ANSI codes in format string only)
-        printf "  │ ${_acol}%s${C_RESET} ${C_DIM}%-5.5s${C_RESET} │ %-20.20s │ ${_grp_col}%-12.12s${C_RESET} │ ${C_DIM}%-10.10s${C_RESET} │\n" \
-            "$_alias_field" "$_badge" "$_host" "$_grp_disp" "$_relts"
+        printf "  │ ${_acol}%-15.15s%s${C_RESET} ${C_DIM}%-5.5s${C_RESET} │ %-20.20s │ ${_GC}%-12.12s${C_RESET} │ ${C_DIM}%-10.10s${C_RESET} │\n" \
+            "$_alias" "$_pin_mark" "$_KB" "$_host" "$_grp_disp" "$_relts"
     done
 
     _ls_hline "  └" "┴" "┘" "$_W1" "$_W2" "$_W3" "$_W4"
@@ -1983,9 +2241,21 @@ cmd_edit() {
     case "$_PROMPT_RESULT" in yes|no) _nf="$_PROMPT_RESULT" ;; *) _nf="$_cf" ;; esac
     wt_input "LocalForward tunnel"           "$_cl"; _nl="${_PROMPT_RESULT:-$_cl}"
 
-    remove_config_block "$_alias"
-    write_config_block "$_alias" "$_nh" "$_nu" "$_np" \
-        "$_ck" "$_nj" "$_nn" "$_na" "$_nf" "$_nl" "$_ngrp"
+    # Update changed fields in place — everything else in the block (extra
+    # forwards, hand-written options, comment layout) stays untouched.
+    backup_config
+    [ "$_nn" != "$_cn" ]     && _block_set_comment "$_alias" "Note"  "$_nn"
+    [ "$_ngrp" != "$_cgrp" ] && _block_set_comment "$_alias" "Group" "$_ngrp"
+    [ "$_nh" != "$_ch" ]     && _block_set "$_alias" "HostName" "$_nh"
+    [ "$_np" != "$_cp" ]     && _block_set "$_alias" "Port" "$_np"
+    [ "$_nu" != "$_cu" ]     && _block_set "$_alias" "User" "$_nu"
+    if [ "$_nj" != "$_cj" ]; then
+        _block_set "$_alias" "ProxyJump" "$_nj"
+        _block_set_comment "$_alias" "JumpAlias" "$_nj"
+    fi
+    [ "$_na" != "$_ca" ]     && _block_set "$_alias" "ServerAliveInterval" "$_na"
+    [ "$_nf" != "$_cf" ]     && _block_set "$_alias" "ForwardAgent" "$_nf"
+    [ "$_nl" != "$_cl" ]     && _block_set "$_alias" "LocalForward" "$_nl"
     success "Alias \"$_alias\" updated."
 
     sync_auto_export
@@ -2009,9 +2279,6 @@ cmd_clone() {
     _cj=$(get_field   "$_src" "ProxyJump")
     _cn=$(get_comment "$_src" "Note")
     _cgrp=$(get_comment "$_src" "Group")
-    _ca=$(get_field   "$_src" "ServerAliveInterval")
-    _cf=$(get_field   "$_src" "ForwardAgent")
-    _cl=$(get_field   "$_src" "LocalForward")
     _def_ktype=$(pref_get "key_type"); [ -z "$_def_ktype" ] && _def_ktype="ed25519"
 
     info "Cloning ${C_BOLD}$_src${C_RESET} — enter new alias details (blank = keep source value)"
@@ -2066,8 +2333,15 @@ cmd_clone() {
     fi
     unset REMOTE_PASS
 
-    write_config_block "$ALIAS" "$_nh" "$_nu" "$_np" \
-        "$KEY_FILE" "$_cj" "$_nn" "$_ca" "$_cf" "$_cl" "$_ngrp"
+    # Copy the source block (all its options), then apply the edited fields
+    backup_config
+    _block_copy "$_src" "$ALIAS"
+    [ "$_nn" != "$_cn" ]     && _block_set_comment "$ALIAS" "Note"  "$_nn"
+    [ "$_ngrp" != "$_cgrp" ] && _block_set_comment "$ALIAS" "Group" "$_ngrp"
+    [ "$_nh" != "$_ch" ]     && _block_set "$ALIAS" "HostName" "$_nh"
+    [ "$_np" != "$_cp" ]     && _block_set "$ALIAS" "Port" "$_np"
+    [ "$_nu" != "$_cu" ]     && _block_set "$ALIAS" "User" "$_nu"
+    _block_set "$ALIAS" "IdentityFile" "$KEY_FILE"
     success "Alias \"$ALIAS\" created from clone of \"$_src\"."
 
     sync_auto_export
@@ -2075,6 +2349,27 @@ cmd_clone() {
 }
 
 # ── REMOVE ────────────────────────────────────────────────────────────────────
+
+# Drop what okssh keeps about an alias outside ~/.ssh/config: per-alias prefs
+# (incl. a stored sshpass password) and its pinned_aliases entry.
+_alias_forget() {
+    for _af_k in $_ALIAS_PREF_KEYS; do pref_del "${_af_k}_$1"; done
+    _af_pin=$(pref_get "pinned_aliases")
+    if [ -n "$_af_pin" ]; then
+        _af_new=$(printf '%s\n' "$_af_pin" | tr ',' '\n' | grep -vxF -e "$1" | tr '\n' ',' | sed 's/,$//')
+        if [ "$_af_new" != "$_af_pin" ]; then pref_set "pinned_aliases" "$_af_new"; fi
+    fi
+}
+
+# Names of tunnels whose alias= is <alias>
+_tunnels_using() {
+    [ -f "$TUNNEL_FILE" ] || return 0
+    awk -v a="$1" '
+        /^\[tunnel\]/ { n = "" }
+        /^name=/      { n = substr($0, 6) }
+        $0 == "alias=" a && n != "" { print n }
+    ' "$TUNNEL_FILE"
+}
 
 cmd_remove() {
     # Non-interactive mode (used by sshop's delete modal):
@@ -2099,10 +2394,13 @@ cmd_remove() {
 
     if [ "$_rm_yes" -eq 1 ]; then
         remove_config_block "$_alias"
+        _alias_forget "$_alias"
         if [ "$_rm_keys" = "yes" ] && [ -n "$_key" ] && [ -f "$_key" ]; then
             rm -f "$_key" "${_key}.pub"
             vlog "Deleted key files: $_key"
         fi
+        _rm_tun=$(_tunnels_using "$_alias" | tr '\n' ' ')
+        [ -n "$_rm_tun" ] && printf 'warn: tunnel(s) still pointing at %s: %s\n' "$_alias" "$_rm_tun" >&2
         sync_auto_export
         sync_keys_update
         printf 'ok: %s\n' "$_alias"
@@ -2118,7 +2416,10 @@ cmd_remove() {
     fi
 
     remove_config_block "$_alias"
+    _alias_forget "$_alias"
     success "Alias \"$_alias\" removed."
+    _rm_tun=$(_tunnels_using "$_alias" | tr '\n' ' ')
+    [ -n "$_rm_tun" ] && warn "Tunnel(s) still pointing at \"$_alias\": $_rm_tun (okssh tunnel rm <name>)"
 
     if [ -n "$_key" ] && [ -f "$_key" ]; then
         _rm_del="$_rm_keys"
@@ -2150,16 +2451,7 @@ cmd_rename() {
     [ "$_old" = "$_new" ] && { info "Names are identical — nothing to do."; return 0; }
     alias_exists "$_new" && die "Alias \"$_new\" already exists. Remove it first."
 
-    _ch=$(get_field   "$_old" "HostName")
-    _cu=$(get_field   "$_old" "User")
-    _cp=$(get_field   "$_old" "Port");  [ -z "$_cp" ] && _cp="22"
-    _ck=$(get_field   "$_old" "IdentityFile")
-    _cj=$(get_field   "$_old" "ProxyJump")
-    _cn=$(get_comment "$_old" "Note")
-    _cgrp=$(get_comment "$_old" "Group")
-    _ca=$(get_field   "$_old" "ServerAliveInterval")
-    _cf=$(get_field   "$_old" "ForwardAgent")
-    _cl=$(get_field   "$_old" "LocalForward")
+    _ck=$(get_field "$_old" "IdentityFile")
 
     # Rename key files if they follow the per-alias naming convention
     _new_key="$_ck"
@@ -2175,27 +2467,35 @@ cmd_rename() {
         fi
     fi
 
-    remove_config_block "$_old"
-    write_config_block "$_new" "$_ch" "$_cu" "$_cp" "$_new_key" "$_cj" "$_cn" "$_ca" "$_cf" "$_cl" "$_cgrp"
+    # Rename in place: only the Host line (and IdentityFile, if the key file
+    # was renamed) change — every other line of the block is kept as-is.
+    backup_config
+    _block_rename "$_old" "$_new"
+    [ "$_new_key" != "$_ck" ] && _block_set "$_new" "IdentityFile" "$_new_key"
+    # Other aliases that jump through this one
+    _jump_refs_rename "$_old" "$_new"
 
     # Migrate per-alias preferences
-    for _pkey in last_connect auto_agent sshpass wol_mac copy_last_remote; do
+    for _pkey in $_ALIAS_PREF_KEYS; do
         _pval=$(pref_get "${_pkey}_${_old}")
         if [ -n "$_pval" ]; then
             pref_set "${_pkey}_${_new}" "$_pval"
-            # Clear old key by setting empty (pref_set with empty value removes it)
-            sed -i.bak "/^${_pkey}_${_old}=/d" "$PREF_FILE" 2>/dev/null \
-                || sed -i "" "/^${_pkey}_${_old}=/d" "$PREF_FILE" 2>/dev/null || true
-            rm -f "${PREF_FILE}.bak" 2>/dev/null || true
         fi
+        pref_del "${_pkey}_${_old}"
     done
 
-    # Update pinned_aliases list
+    # Update pinned_aliases list (whole entries only)
     _pinned=$(pref_get "pinned_aliases")
-    if printf '%s' "${_pinned}," | tr ',' '\n' | grep -qx "$_old"; then
-        _new_pinned=$(printf '%s' "$_pinned" | tr ',' '\n' | \
-            sed "s/^${_old}$/${_new}/" | tr '\n' ',' | sed 's/,$//' || true)
-        pref_set "pinned_aliases" "$_new_pinned"
+    if [ -n "$_pinned" ]; then
+        _new_pinned=$(printf '%s\n' "$_pinned" | tr ',' '\n' \
+            | awk -v a="$_old" -v b="$_new" '$0 == a { $0 = b } { print }' | tr '\n' ',' | sed 's/,$//')
+        if [ "$_new_pinned" != "$_pinned" ]; then pref_set "pinned_aliases" "$_new_pinned"; fi
+    fi
+
+    # Tunnels that use this alias
+    if [ -f "$TUNNEL_FILE" ]; then
+        awk -v a="$_old" -v b="$_new" '$0 == "alias=" a { print "alias=" b; next } { print }' \
+            "$TUNNEL_FILE" > "${TUNNEL_FILE}.tmp" && mv "${TUNNEL_FILE}.tmp" "$TUNNEL_FILE"
     fi
 
     success "Alias \"$_old\" renamed to \"$_new\"."
@@ -2258,10 +2558,9 @@ cmd_rotate() {
         printf '  Aborting.\n\n'; return 0
     fi
 
-    wt_password "Remote password (to copy new key)"
-    _pass="$_PROMPT_RESULT"
-
-    _old_type=$(basename "$_old_key" | awk -F'_' '{print $2}')
+    _old_type=""
+    [ -n "$_old_key" ] && _old_type=$(basename "$_old_key" | awk -F'_' '{print $2}')
+    case "$_old_type" in ed25519|rsa|ecdsa) : ;; *) _old_type="" ;; esac
     [ -z "$_old_type" ] && { _old_type=$(pref_get "key_type"); [ -z "$_old_type" ] && _old_type="ed25519"; }
     wt_input "New key type (ed25519 / rsa / ecdsa)" "$_old_type"
     case "$_PROMPT_RESULT" in
@@ -2269,27 +2568,67 @@ cmd_rotate() {
         *) _new_type="$_old_type" ;;
     esac
 
-    _new_key="${_old_key}_new"
+    mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+    # An alias without IdentityFile gets the standard per-alias key name
+    _base_key="${_old_key:-$SSH_DIR/id_${_new_type}_${_alias}}"
+    _new_key="${_base_key}_new"
     info "Generating new ${_new_type} key: $_new_key"
     _keygen "$_new_key" "$_new_type" "${_user}@${_host}-${_alias}-rotated"
     chmod 600 "$_new_key"; chmod 644 "${_new_key}.pub"
     success "New key generated."
 
-    info "Copying new key to remote ..."
-    if copy_key_to_remote "$_new_key" "$_user" "$_host" "$_port" "$_pass" "$_jump"; then
-        unset _pass
-        success "New key copied. Password cleared."
+    # Install the new public key. The current key normally still works, so try
+    # it first — no password needed, and it works on key-only servers. Fall
+    # back to password auth (ssh-copy-id) only if that fails.
+    info "Installing new public key on remote ..."
+    if ssh -F "$CONFIG_FILE" -o BatchMode=yes -o ConnectTimeout=10 "$_alias" \
+            'umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys' \
+            < "${_new_key}.pub" 2>/dev/null; then
+        success "New key installed (authenticated with the current key)."
     else
-        unset _pass
-        die "Key copy failed — rotation aborted. Old key still active."
+        warn "The current key was not accepted — falling back to password auth."
+        wt_password "Remote password (to copy new key)"
+        _pass="$_PROMPT_RESULT"
+        if copy_key_to_remote "$_new_key" "$_user" "$_host" "$_port" "$_pass" "$_jump"; then
+            unset _pass
+            success "New key copied. Password cleared."
+        else
+            unset _pass
+            rm -f "$_new_key" "${_new_key}.pub"
+            die "Key copy failed — rotation aborted. Old key still active."
+        fi
     fi
 
+    # Prove the NEW key logs in before touching the old one — removing the old
+    # key first could lock you out. Uses a temp copy of the config with this
+    # alias pointed at the new key (so HostName/Port/User/ProxyJump all apply)
+    # and IdentitiesOnly forced, so neither the old key nor the agent can
+    # answer for it.
+    info "Verifying the new key ..."
+    _vcfg=$(mktemp 2>/dev/null || mktemp -t okssh)
+    cp "$CONFIG_FILE" "$_vcfg"
+    _cfg_save="$CONFIG_FILE"; CONFIG_FILE="$_vcfg"
+    _block_set "$_alias" "IdentityFile" "$_new_key"
+    CONFIG_FILE="$_cfg_save"
+    if ! ssh -F "$_vcfg" -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
+            "$_alias" true 2>/dev/null; then
+        rm -f "$_vcfg"
+        die "The new key was installed but does not authenticate — rotation aborted.\n  Old key unchanged; new key kept at: $_new_key"
+    fi
+    rm -f "$_vcfg"
+    success "New key authenticates."
+
     info "Removing old key from remote authorized_keys ..."
-    _old_pub=$(cat "${_old_key}.pub" 2>/dev/null || printf '')
-    if [ -n "$_old_pub" ]; then
+    _old_blob=""
+    [ -n "$_old_key" ] && _old_blob=$(awk '{print $2; exit}' "${_old_key}.pub" 2>/dev/null || true)
+    if [ -n "$_old_blob" ]; then
+        # Exact match on the key blob (base64 — safe to quote). Rewrites in
+        # place (keeps the file's mode) and only if grep succeeded; the
+        # previous contents stay in authorized_keys.okssh-bak.
+        # shellcheck disable=SC2029  # blob is meant to expand locally
         ssh -F "$CONFIG_FILE" -o BatchMode=yes -o ConnectTimeout=10 "$_alias" \
-            "sed -i.bak '/$(printf '%s' "$_old_pub" | sed 's/[\/&]/\\&/g')/d' \
-            ~/.ssh/authorized_keys" 2>/dev/null \
+            "f=~/.ssh/authorized_keys; cp \"\$f\" \"\$f.okssh-bak\" && { grep -vF '$_old_blob' \"\$f.okssh-bak\" > \"\$f.okssh-tmp\"; [ \$? -le 1 ]; } && cat \"\$f.okssh-tmp\" > \"\$f\"; rc=\$?; rm -f \"\$f.okssh-tmp\"; exit \$rc" \
+            2>/dev/null \
             && success "Old key removed from remote." \
             || warn "Could not auto-remove old key — remove manually from remote authorized_keys."
     fi
@@ -2297,26 +2636,21 @@ cmd_rotate() {
     # If the key follows the id_<type>_<alias> convention and the type
     # changed, rename to match — otherwise audits, badges and humans keep
     # reading the wrong type from the filename.
-    _final_key="$_old_key"
-    case "$(basename "$_old_key")" in
+    _final_key="$_base_key"
+    case "$(basename "$_base_key")" in
         id_*_"$_alias")
             _final_key="$SSH_DIR/id_${_new_type}_${_alias}" ;;
     esac
     mv "$_new_key" "$_final_key"
     mv "${_new_key}.pub" "${_final_key}.pub"
-    if [ "$_final_key" != "$_old_key" ]; then
+    if [ -n "$_old_key" ] && [ "$_final_key" != "$_old_key" ]; then
         rm -f "$_old_key" "${_old_key}.pub"
-        # rewrite the config block so IdentityFile points at the new name
-        _rj=$(get_field   "$_alias" "ProxyJump")
-        _rn=$(get_comment "$_alias" "Note")
-        _rg=$(get_comment "$_alias" "Group")
-        _ra=$(get_field   "$_alias" "ServerAliveInterval")
-        _rf=$(get_field   "$_alias" "ForwardAgent")
-        _rl=$(get_field   "$_alias" "LocalForward")
-        remove_config_block "$_alias"
-        write_config_block "$_alias" "$_host" "$_user" "$_port" \
-            "$_final_key" "$_rj" "$_rn" "$_ra" "$_rf" "$_rl" "$_rg"
         info "Key renamed: $(basename "$_old_key") → $(basename "$_final_key")"
+    fi
+    if [ "$_final_key" != "$_old_key" ]; then
+        # point IdentityFile at the new name, in place
+        backup_config
+        _block_set "$_alias" "IdentityFile" "$_final_key"
     fi
     success "Key files updated locally."
 
@@ -2328,38 +2662,90 @@ cmd_rotate() {
 
 # ── EXPORT ────────────────────────────────────────────────────────────────────
 
+# [alias] records for every alias — shared by `okssh export`, the sync
+# auto-export and `okssh diff`, so all three always agree on the format.
+_export_body() {
+    _alias_table | while IFS="$_US" read -r _a _h _u _p _k _j _al _fa _lf _n _g _rest; do
+        printf '[alias]\nname=%s\nhostname=%s\nuser=%s\nport=%s\n' "$_a" "$_h" "$_u" "${_p:-22}"
+        [ -n "$_n"  ] && printf 'note=%s\n'      "$_n"
+        [ -n "$_g"  ] && printf 'group=%s\n'     "$_g"
+        [ -n "$_j"  ] && printf 'jump=%s\n'      "$_j"
+        [ -n "$_al" ] && printf 'keepalive=%s\n' "$_al"
+        [ -n "$_fa" ] && printf 'fwdagent=%s\n'  "$_fa"
+        [ -n "$_lf" ] && printf 'localfwd=%s\n'  "$_lf"
+        printf '\n'
+    done
+}
+
+# Ansible INI inventory: one host per alias (inventory name = alias, so ssh
+# can also resolve it through ~/.ssh/config), plus one group per okssh group.
+_ansible_inventory() {
+    printf '# okssh Ansible inventory — version %s — %s\n' "$OKSSH_VERSION" "$(date)"
+    printf '# Hosts are okssh aliases; groups come from okssh groups/tags.\n\n'
+    _alias_table | awk -F "$_US" '
+        function q(v) { return (v ~ /[ \t"'"'"']/) ? "\"" v "\"" : v }
+        function gname(g) { gsub(/[^A-Za-z0-9_]/, "_", g); if (g ~ /^[0-9]/) g = "g_" g; return g }
+        {
+            line = $1
+            if ($2 != "") line = line " ansible_host=" q($2)
+            if ($3 != "") line = line " ansible_user=" q($3)
+            line = line " ansible_port=" ($4 != "" ? $4 : 22)
+            if ($5 != "") line = line " ansible_ssh_private_key_file=" q($5)
+            if ($6 != "") line = line " ansible_ssh_common_args=\"-o ProxyJump=" $6 "\""
+            hosts[++n] = line
+            ng = split($11, gs, ",")
+            for (i = 1; i <= ng; i++) {
+                g = gs[i]; gsub(/^[ \t]+|[ \t]+$/, "", g); if (g == "") continue
+                g = gname(g)
+                if (!(g in members)) order[++ngroups] = g
+                members[g] = members[g] $1 "\n"
+            }
+        }
+        END {
+            print "[all]"
+            for (i = 1; i <= n; i++) print hosts[i]
+            for (i = 1; i <= ngroups; i++) { printf "\n[%s]\n%s", order[i], members[order[i]] }
+        }
+    '
+}
+
+# okssh export [--ansible] [file|-]   ("-" writes to stdout)
 cmd_export() {
-    _outfile="${1:-$HOME/okssh-export-$(date +%Y%m%d).txt}"
+    _ex_fmt="okssh"; _outfile=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --ansible) _ex_fmt="ansible" ;;
+            --*)       die "Unknown flag: '$1'  (use: okssh export [--ansible] [file|-])" ;;
+            *)         _outfile="$1" ;;
+        esac
+        shift
+    done
+    if [ -z "$_outfile" ]; then
+        if [ "$_ex_fmt" = "ansible" ]; then
+            _outfile="$HOME/okssh-inventory-$(date +%Y%m%d).ini"
+        else
+            _outfile="$HOME/okssh-export-$(date +%Y%m%d).txt"
+        fi
+    fi
     _aliases=$(list_aliases)
     if [ -z "$_aliases" ]; then
-        printf '\n  No aliases to export.\n\n'; return 0
+        printf '\n  No aliases to export.\n\n' >&2; return 0
     fi
-    {
-        printf '# okssh export — version %s — %s\n' "$OKSSH_VERSION" "$(date)"
-        printf '# Import with: okssh import <file>\n'
-        printf '# NOTE: Private keys are not included.\n\n'
-        printf '%s\n' "$_aliases" | while IFS= read -r _alias; do
-            _host=$(get_field   "$_alias" "HostName")
-            _user=$(get_field   "$_alias" "User")
-            _port=$(get_field   "$_alias" "Port"); [ -z "$_port" ] && _port="22"
-            _jump=$(get_field   "$_alias" "ProxyJump")
-            _alive=$(get_field  "$_alias" "ServerAliveInterval")
-            _fwda=$(get_field   "$_alias" "ForwardAgent")
-            _lfwd=$(get_field   "$_alias" "LocalForward")
-            _note=$(get_comment "$_alias" "Note")
-            _grp=$(get_comment  "$_alias" "Group")
-            printf '[alias]\n'
-            printf 'name=%s\nhostname=%s\nuser=%s\nport=%s\n' \
-                "$_alias" "$_host" "$_user" "$_port"
-            [ -n "$_note"  ] && printf 'note=%s\n'      "$_note"
-            [ -n "$_grp"   ] && printf 'group=%s\n'     "$_grp"
-            [ -n "$_jump"  ] && printf 'jump=%s\n'      "$_jump"
-            [ -n "$_alive" ] && printf 'keepalive=%s\n' "$_alive"
-            [ -n "$_fwda"  ] && printf 'fwdagent=%s\n'  "$_fwda"
-            [ -n "$_lfwd"  ] && printf 'localfwd=%s\n'  "$_lfwd"
-            printf '\n'
-        done
-    } > "$_outfile"
+    if [ "$_ex_fmt" = "ansible" ]; then
+        _ex_gen() { _ansible_inventory; }
+    else
+        _ex_gen() {
+            printf '# okssh export — version %s — %s\n' "$OKSSH_VERSION" "$(date)"
+            printf '# Import with: okssh import <file>\n'
+            printf '# NOTE: Private keys are not included.\n\n'
+            _export_body
+        }
+    fi
+    if [ "$_outfile" = "-" ]; then
+        _ex_gen
+        return 0
+    fi
+    _ex_gen > "$_outfile"
     _count=$(printf '%s\n' "$_aliases" | grep -c '.' || printf '0')
     success "Exported $_count alias(es) to: $_outfile"
     printf '\n'
@@ -2415,7 +2801,9 @@ cmd_import() {
         _imported=$(( _imported + 1 ))
     }
 
-    while IFS= read -r _line || [ -n "$_line" ]; do
+    # The file is read on fd 3 so the prompts inside _do_import (overwrite?,
+    # password) read the terminal instead of swallowing lines of the file.
+    while IFS= read -r _line <&3 || [ -n "$_line" ]; do
         case "$_line" in '#'*|'') continue ;; esac
         case "$_line" in
             '[alias]')   _do_import
@@ -2432,7 +2820,7 @@ cmd_import() {
             fwdagent=*)  _cur_fwda="${_line#fwdagent=}" ;;
             localfwd=*)  _cur_lfwd="${_line#localfwd=}" ;;
         esac
-    done < "$_infile"
+    done 3< "$_infile"
     _do_import
 
     sync_auto_export
@@ -2475,7 +2863,9 @@ _cmd_prefer_alias() {
                         die "sshpass not installed — needed for password auth"
                     wt_password "SSH password for $_pa"
                     [ -z "$_PROMPT_RESULT" ] && { warn "No password entered. Nothing saved.\n"; return 0; }
-                    _enc=$(printf '%s' "$_PROMPT_RESULT" | base64)
+                    # one line: base64 wraps at 76 chars, and a wrapped value
+                    # would split across two "lines" of the prefs file
+                    _enc=$(printf '%s' "$_PROMPT_RESULT" | base64 | tr -d '\n')
                     unset _PROMPT_RESULT
                     pref_set "sshpass_$_pa" "$_enc"
                     unset _enc
@@ -2950,6 +3340,17 @@ sync_keys_update() {
         return 0
     fi
 
+    # Automatic rebuilds (after add/rm/rename/rotate/import) must never block
+    # on the passphrase prompt when nobody is at a terminal — sshop, scripts
+    # and pipes would hang forever on the read below. Flag the archive stale
+    # instead; `okssh sync keys update` (passes "explicit") still prompts and
+    # also accepts a piped passphrase.
+    if [ "${1:-}" != "explicit" ] && [ ! -t 0 ]; then
+        pref_set "keys_sync_stale" "1"
+        printf 'warn: key-sync archive not updated (no terminal for the passphrase) — run: okssh sync keys update\n' >&2
+        return 0
+    fi
+
     printf '\n'
     info "Key sync is enabled — rebuilding encrypted key archive."
     printf "  Enter your key-sync passphrase to update the archive.\n"
@@ -2957,8 +3358,39 @@ sync_keys_update() {
     cli_prompt_secret "Key-sync passphrase"
     _kpass="$_PROMPT_RESULT"
 
-    # Build a temp tar of all private keys + their pub files
+    # The archive must stay decryptable with ONE passphrase. A typo here used
+    # to silently re-encrypt every key under a passphrase nobody knows.
+    #   existing archive → the passphrase must decrypt it (to a valid tar)
+    #   first build      → type it twice
+    _ks_bad=""
+    if [ -z "$_kpass" ]; then
+        _ks_bad="Empty passphrase"
+    elif [ -f "$_enc_file" ]; then
+        printf '%s' "$_kpass" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 \
+            -pass stdin -in "$_enc_file" 2>/dev/null | tar -tf - >/dev/null 2>&1 \
+            || _ks_bad="Passphrase does not match the existing key archive"
+    else
+        cli_prompt_secret "Repeat passphrase"
+        [ "$_PROMPT_RESULT" = "$_kpass" ] || _ks_bad="Passphrases do not match"
+        unset _PROMPT_RESULT
+    fi
+    if [ -n "$_ks_bad" ]; then
+        unset _kpass
+        pref_set "keys_sync_stale" "1"
+        if [ "${1:-}" = "explicit" ]; then
+            die "${_ks_bad} — key archive not updated.\n  To start over with a new passphrase: okssh sync keys disable, then okssh sync keys enable"
+        fi
+        # automatic rebuild: the caller's own change (add/rm/…) already
+        # happened — report, don't abort it
+        warn "${_ks_bad} — key archive not updated. Run: okssh sync keys update"
+        return 0
+    fi
+
+    # Build a temp tar of all private keys + their pub files. The temp dir
+    # holds plaintext private keys: remove it even on Ctrl+C / kill.
     _tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t okssh)
+    trap 'rm -rf "$_tmpdir"' EXIT
+    trap 'rm -rf "$_tmpdir"; exit 130' HUP INT TERM
     _tarball="$_tmpdir/keys.tar"
 
     # Copy keys into temp dir preserving names
@@ -2978,23 +3410,29 @@ sync_keys_update() {
 
     tar -cf "$_tarball" -C "$_tmpdir" . 2>/dev/null
 
-    # Encrypt with AES-256-CBC + PBKDF2
+    # Encrypt with AES-256-CBC + PBKDF2 into a temp file, then move it into
+    # place — an interrupted run never leaves a truncated keys.enc behind
     printf '%s' "$_kpass" | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 \
         -pass stdin \
         -in  "$_tarball" \
-        -out "$_enc_file" 2>/dev/null || {
+        -out "${_enc_file}.tmp" 2>/dev/null \
+        && mv "${_enc_file}.tmp" "$_enc_file" || {
             unset _kpass
-            rm -rf "$_tmpdir"
+            rm -rf "$_tmpdir" "${_enc_file}.tmp"
+            trap - EXIT HUP INT TERM
+            pref_set "keys_sync_stale" "1"
             warn "Encryption failed — key archive not updated."
-            return 1
+            return 0
         }
     unset _kpass
     rm -rf "$_tmpdir"
+    trap - EXIT HUP INT TERM
 
     _kcount=$(printf '%s\n' "$_key_list" | grep -c '.' || printf '0')
     _ts=$(date '+%Y-%m-%d %H:%M')
     pref_set "keys_sync_last_update" "$_ts"
     pref_set "keys_sync_count" "$_kcount"
+    pref_del "keys_sync_stale"
     success "Key archive updated ($_kcount key(s)) — encrypted with AES-256."
     vlog "sync_keys_update: wrote $_enc_file at $_ts"
 }
@@ -3041,7 +3479,11 @@ cmd_sync_keys() {
             fi
 
             printf "  Keys archived:  %s\n"  "${_kcount:-unknown}"
-            printf "  Last updated:   %s\n\n" "${_last:-never}"
+            printf "  Last updated:   %s\n" "${_last:-never}"
+            if [ -n "$(pref_get "keys_sync_stale")" ]; then
+                printf "  ${C_YELLOW}⚠ Out of date${C_RESET} — keys changed without a terminal; run: okssh sync keys update\n"
+            fi
+            printf '\n'
 
             printf "  ${C_BOLD}Security reminder:${C_RESET}\n"
             printf "  Your passphrase is never stored. You will be prompted\n"
@@ -3150,6 +3592,7 @@ cmd_sync_keys() {
             pref_set "keys_sync" ""
             pref_set "keys_sync_last_update" ""
             pref_set "keys_sync_count" ""
+            pref_del "keys_sync_stale"
             success "Key sync disabled."
             printf '\n'
             ;;
@@ -3158,7 +3601,7 @@ cmd_sync_keys() {
         update)
             _ks=$(pref_get "keys_sync")
             [ "$_ks" = "enabled" ] || die "Key sync is not enabled. Run: okssh sync keys enable"
-            sync_keys_update
+            sync_keys_update explicit
             ;;
 
         # ── RESTORE ─────────────────────────────────────────────────────────
@@ -3185,6 +3628,9 @@ cmd_sync_keys() {
             _kpass="$_PROMPT_RESULT"
 
             _tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t okssh)
+            # decrypted keys land here — remove them even on Ctrl+C / kill
+            trap 'rm -rf "$_tmpdir"' EXIT
+            trap 'rm -rf "$_tmpdir"; exit 130' HUP INT TERM
 
             printf '%s' "$_kpass" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 \
                 -pass stdin -in "$_enc" -out "$_tmpdir/keys.tar" 2>/dev/null || {
@@ -3223,6 +3669,7 @@ cmd_sync_keys() {
             done
 
             rm -rf "$_tmpdir"
+            trap - EXIT HUP INT TERM
             success "Restored $_restored key(s) to ~/.ssh/"
             printf '\n'
             ;;
@@ -3406,7 +3853,9 @@ cmd_snip_edit() {
     wt_input "Description" "$_cd"; _nd="${_PROMPT_RESULT:-$_cd}"
     wt_input "Command"     "$_cc"; _nc="${_PROMPT_RESULT:-$_cc}"
     _ns="no"
-    wt_yesno "Uses sudo on remote? (current: ${_cs:-no})" && _ns="yes" || _ns="no"
+    # default = current value, so Enter ("keep") doesn't silently turn sudo off
+    _cs_def="n"; [ "$_cs" = "yes" ] && _cs_def="y"
+    wt_yesno "Uses sudo on remote? (current: ${_cs:-no})" "$_cs_def" && _ns="yes" || _ns="no"
     snip_remove_block "$_name"
     snip_write "$_name" "$_nd" "$_nc" "$_ns"
     snip_auto_export
@@ -3457,11 +3906,10 @@ cmd_snip_run() {
     [ -z "$_aliases" ] && die "No SSH aliases configured. Add one with: okssh add"
 
     if [ -n "$_run_group" ]; then
-        _aliases=$(printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-            _g=$(get_comment "$_a" "Group")
-            printf '%s' "$_g" | tr ',' '\n' | tr -d ' ' | grep -qx "$_run_group" \
-                && printf '%s\n' "$_a"
-        done)
+        _aliases=$(_alias_table | awk -F "$_US" -v g="$_run_group" '{
+            n = split($11, gs, ",")
+            for (i = 1; i <= n; i++) { x = gs[i]; gsub(/[ \t]/, "", x); if (x == g) { print $1; break } }
+        }')
         [ -z "$_aliases" ] && die "No aliases found in group \"$_run_group\""
         info "Running snippet on group: ${C_BOLD}$_run_group${C_RESET}"
     fi
@@ -3572,7 +4020,10 @@ _EOPRD
         rm -rf "$_par_tmpdir"
     else
         # ── Sequential execution ──────────────────────────────────────────────
-        while IFS= read -r _target; do
+        # Targets come in on fd 3: the per-host sudo password prompt reads
+        # stdin, which must stay the terminal (it used to read — or hit EOF
+        # on — the target list itself).
+        while IFS= read -r _target <&3; do
             [ -z "$_target" ] && continue
             if ! alias_exists "$_target"; then
                 warn "\"$_target\" not found — skipping."; continue
@@ -3622,7 +4073,7 @@ _EOPRD
                 printf '\n'; warn "Failed on $_target (exit code $_sexit)"
             fi
             printf '\n'
-        done <<_EOTGT
+        done 3<<_EOTGT
 $(printf '%s\n' "$_targets")
 _EOTGT
     fi
@@ -3762,9 +4213,19 @@ _wt_tunnel_status_text() {
     done
 }
 
+# alias US key-basename US yes|no — one row per alias that has an
+# IdentityFile; loaded = its .pub key blob is in `ssh-add -L`
+_agent_key_rows() {
+    _AC_BLOBS=$(ssh-add -L 2>/dev/null | awk '{print $2}' || true)
+    _alias_cols 1 5 16 | while IFS="$_US" read -r _a _key _ld; do   # alias key loaded
+            [ -z "$_key" ] && continue
+            _yn=no; [ "$_ld" = "1" ] && _yn=yes
+            printf '%s\037%s\037%s\n' "$_a" "${_key##*/}" "$_yn"
+        done
+}
+
 # Plain-text agent list (no ANSI) — used by _wt_agent_menu
 _wt_agent_list_text() {
-    _loaded=$(ssh-add -l 2>/dev/null || true)
     _aliases=$(list_aliases)
     if [ -z "$_aliases" ]; then
         printf 'No aliases configured.\n'; return 0
@@ -3775,17 +4236,8 @@ _wt_agent_list_text() {
         21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
         41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 2>/dev/null
     printf '\n'
-    printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-        [ -z "$_a" ] && continue
-        _key=$(get_field "$_a" "IdentityFile")
-        [ -z "$_key" ] && continue
-        _fp=""
-        [ -f "$_key" ] && _fp=$(ssh-keygen -lf "$_key" 2>/dev/null | awk '{print $2}')
-        if [ -n "$_fp" ] && printf '%s\n' "$_loaded" | grep -qF "$_fp"; then
-            printf '%-18s %-8s %s\n' "$_a" "yes" "$(basename "$_key")"
-        else
-            printf '%-18s %-8s %s\n' "$_a" "no" "$(basename "$_key")"
-        fi
+    _agent_key_rows | while IFS="$_US" read -r _a _kb _yn; do
+        printf '%-18s %-8s %s\n' "$_a" "$_yn" "$_kb"
     done
 }
 
@@ -3796,27 +4248,9 @@ wt_status() {
         wt_msg "No aliases configured.\n\nAdd one with: okssh add"
         return 0
     fi
-    _timeout=8
     _total=$(printf '%s\n' "$_aliases" | grep -c . || true)
     _tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t okssh)
-    while IFS= read -r _a; do
-        [ -z "$_a" ] && continue
-        (
-            _ts=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
-            if ssh -n -F "$CONFIG_FILE" \
-                   -o BatchMode=yes \
-                   -o ConnectTimeout="$_timeout" \
-                   -o StrictHostKeyChecking=accept-new \
-                   "$_a" true 2>/dev/null; then
-                _te=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
-                printf 'ok:%d' "$(( _te - _ts ))" > "$_tmpdir/$_a"
-            else
-                printf 'fail' > "$_tmpdir/$_a"
-            fi
-        ) &
-    done <<_EOWST
-$(printf '%s\n' "$_aliases")
-_EOWST
+    _probe_all "$_tmpdir"
     # Gauge progress bar while probes run
     {
         while true; do
@@ -3826,17 +4260,16 @@ _EOWST
             sleep 0.3
         done
     } | whiptail --title "okssh — Status" \
-        --gauge "Testing $_total aliases in parallel (timeout: ${_timeout}s)..." 7 60 0 || true
+        --gauge "Testing $_total aliases in parallel (timeout: ${_PROBE_TIMEOUT}s)..." 7 60 0 || true
     wait
     _txt=$(
         printf '%-18s %-22s %-16s %s\n' "ALIAS" "HOSTNAME" "STATUS" "LAST SEEN"
         printf '─%.0s' $(seq 1 70) 2>/dev/null || \
             printf '──────────────────────────────────────────────────────────────────────'
         printf '\n'
-        printf '%s\n' "$_aliases" | while IFS= read -r _a; do
+        _NOW=$(date +%s)
+        _alias_cols 1 2 12 | while IFS="$_US" read -r _a _h _last; do
             [ -z "$_a" ] && continue
-            _h=$(get_field "$_a" "HostName")
-            _last=$(pref_get "last_connect_$_a")
             _relts=$(_rel_time "$_last")
             _res=""; [ -f "$_tmpdir/$_a" ] && _res=$(cat "$_tmpdir/$_a")
             case "$_res" in
@@ -3858,8 +4291,8 @@ wt_audit() {
         wt_msg "Key rotation auditing is globally disabled.\n\nRe-enable via Preferences → Key rotation threshold."
         return 0
     fi
-    _aliases=$(list_aliases)
-    if [ -z "$_aliases" ]; then
+    _scan=$(_audit_scan)
+    if [ -z "$_scan" ]; then
         wt_msg "No aliases configured.\n\nAdd one with: okssh add"
         return 0
     fi
@@ -3870,28 +4303,15 @@ wt_audit() {
             21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
             41 42 43 44 2>/dev/null
         printf '\n\n'
-        printf '%s\n' "$_aliases" | while IFS= read -r _a; do
+        printf '%s\n' "$_scan" | while IFS="$_US" read -r _a _st _t _ov; do
             [ -z "$_a" ] && continue
-            _alias_thresh=$(pref_get "audit_threshold_${_a}")
-            [ -z "$_alias_thresh" ] && _alias_thresh=$_threshold
-            if [ "$_alias_thresh" = "off" ]; then
-                printf '  —  %-18s auditing disabled\n' "$_a"
-                continue
-            fi
-            _thresh_note=""
-            [ "$_alias_thresh" != "$_threshold" ] && _thresh_note=" [override: ${_alias_thresh}d]"
-            _key=$(get_field "$_a" "IdentityFile")
-            if [ -z "$_key" ] || [ ! -f "$_key" ]; then
-                printf '  ⚠  %-18s key file not found%s\n' "$_a" "$_thresh_note"
-                continue
-            fi
-            _kname=$(basename "$_key")
-            if find "$SSH_DIR" -maxdepth 1 -name "$_kname" -mtime "+${_alias_thresh}" \
-                    2>/dev/null | grep -q .; then
-                printf '  ⚠  %-18s key >%s days old%s\n' "$_a" "$_alias_thresh" "$_thresh_note"
-            else
-                printf '  ✔  %-18s key is current%s\n' "$_a" "$_thresh_note"
-            fi
+            _thresh_note=""; [ "$_ov" = "1" ] && _thresh_note=" [override: ${_t}d]"
+            case "$_st" in
+                off)     printf '  —  %-18s auditing disabled\n' "$_a" ;;
+                missing) printf '  ⚠  %-18s key file not found%s\n' "$_a" "$_thresh_note" ;;
+                old)     printf '  ⚠  %-18s key >%s days old%s\n' "$_a" "$_t" "$_thresh_note" ;;
+                *)       printf '  ✔  %-18s key is current%s\n' "$_a" "$_thresh_note" ;;
+            esac
         done
     )
     wt_scrollmsg "okssh — Key Age Audit" "$_txt"
@@ -4448,7 +4868,7 @@ cmd_tag() {
     alias_exists "$_alias" || die "Alias \"$_alias\" not found."
     _cur_grp=$(get_comment "$_alias" "Group")
     if [ -n "$_cur_grp" ]; then
-        printf '%s' "$_cur_grp" | tr ',' '\n' | grep -qx "$_grp" && {
+        printf '%s' "$_cur_grp" | tr ',' '\n' | grep -qxF -e "$_grp" && {
             info "\"$_alias\" is already in group \"$_grp\"."
             return 0
         }
@@ -4456,13 +4876,8 @@ cmd_tag() {
     else
         _new_grp="$_grp"
     fi
-    _ch=$(get_field "$_alias" "HostName");         _cu=$(get_field "$_alias" "User")
-    _cp=$(get_field "$_alias" "Port");              [ -z "$_cp" ] && _cp="22"
-    _ck=$(get_field "$_alias" "IdentityFile");     _cj=$(get_field "$_alias" "ProxyJump")
-    _cn=$(get_comment "$_alias" "Note");           _ca=$(get_field "$_alias" "ServerAliveInterval")
-    _cf=$(get_field "$_alias" "ForwardAgent");     _cl=$(get_field "$_alias" "LocalForward")
-    remove_config_block "$_alias"
-    write_config_block "$_alias" "$_ch" "$_cu" "$_cp" "$_ck" "$_cj" "$_cn" "$_ca" "$_cf" "$_cl" "$_new_grp"
+    backup_config
+    _block_set_comment "$_alias" "Group" "$_new_grp"
     sync_auto_export
     success "\"$_alias\" tagged with group \"$_grp\"."
 }
@@ -4475,19 +4890,40 @@ cmd_untag() {
     if [ -z "$_cur_grp" ]; then
         info "\"$_alias\" has no groups."; return 0
     fi
-    printf '%s' "$_cur_grp" | tr ',' '\n' | grep -qx "$_grp" || {
+    printf '%s' "$_cur_grp" | tr ',' '\n' | grep -qxF -e "$_grp" || {
         info "\"$_alias\" is not in group \"$_grp\"."; return 0
     }
-    _new_grp=$(printf '%s' "$_cur_grp" | tr ',' '\n' | grep -vx "$_grp" | tr '\n' ',' | sed 's/,$//' || true)
-    _ch=$(get_field "$_alias" "HostName");         _cu=$(get_field "$_alias" "User")
-    _cp=$(get_field "$_alias" "Port");              [ -z "$_cp" ] && _cp="22"
-    _ck=$(get_field "$_alias" "IdentityFile");     _cj=$(get_field "$_alias" "ProxyJump")
-    _cn=$(get_comment "$_alias" "Note");           _ca=$(get_field "$_alias" "ServerAliveInterval")
-    _cf=$(get_field "$_alias" "ForwardAgent");     _cl=$(get_field "$_alias" "LocalForward")
-    remove_config_block "$_alias"
-    write_config_block "$_alias" "$_ch" "$_cu" "$_cp" "$_ck" "$_cj" "$_cn" "$_ca" "$_cf" "$_cl" "$_new_grp"
+    _new_grp=$(printf '%s' "$_cur_grp" | tr ',' '\n' | grep -vxF -e "$_grp" | tr '\n' ',' | sed 's/,$//' || true)
+    backup_config
+    _block_set_comment "$_alias" "Group" "$_new_grp"
     sync_auto_export
     success "\"$_alias\" removed from group \"$_grp\"."
+}
+
+# _probe_all <tmpdir> — full-SSH reachability probe of every alias in
+# parallel (BatchMode, 8s timeout); writes "ok:<ms>" or "fail" to
+# <tmpdir>/<alias>. Returns immediately; callers poll the dir and `wait`.
+_PROBE_TIMEOUT=8
+_probe_all() {
+    _pa_dir="$1"
+    while IFS= read -r _a; do
+        [ -z "$_a" ] && continue
+        (
+            _ts=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
+            if ssh -n -F "$CONFIG_FILE" \
+                   -o BatchMode=yes \
+                   -o ConnectTimeout="$_PROBE_TIMEOUT" \
+                   -o StrictHostKeyChecking=accept-new \
+                   "$_a" true 2>/dev/null; then
+                _te=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
+                printf 'ok:%d' "$(( _te - _ts ))" > "$_pa_dir/$_a"
+            else
+                printf 'fail' > "$_pa_dir/$_a"
+            fi
+        ) &
+    done <<_EOPROBE
+$(list_aliases)
+_EOPROBE
 }
 
 # ── STATUS DASHBOARD ──────────────────────────────────────────────────────────
@@ -4509,38 +4945,19 @@ cmd_status() {
         fi
         return 0
     fi
-    _timeout=8
     _tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t okssh)
     _total=$(printf '%s\n' "$_aliases" | grep -c . || true)
 
     # Launch parallel SSH probes with ms latency measurement
-    while IFS= read -r _a; do
-        [ -z "$_a" ] && continue
-        (
-            _ts=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
-            if ssh -n -F "$CONFIG_FILE" \
-                   -o BatchMode=yes \
-                   -o ConnectTimeout="$_timeout" \
-                   -o StrictHostKeyChecking=accept-new \
-                   "$_a" true 2>/dev/null; then
-                _te=$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s)")
-                printf 'ok:%d' "$(( _te - _ts ))" > "$_tmpdir/$_a"
-            else
-                printf 'fail' > "$_tmpdir/$_a"
-            fi
-        ) &
-    done <<_EOST
-$(printf '%s\n' "$_aliases")
-_EOST
+    _probe_all "$_tmpdir"
+    _rows=$(_alias_cols 1 2 12)   # alias host last_connect
 
     if [ "$_st_json" -eq 1 ]; then
         wait
         printf '['
         _st_first=1
-        while IFS= read -r _a; do
+        while IFS="$_US" read -r _a _h _last; do
             [ -z "$_a" ] && continue
-            _h=$(get_field "$_a" "HostName")
-            _last=$(pref_get "last_connect_$_a")
             _res=""; [ -f "$_tmpdir/$_a" ] && _res=$(cat "$_tmpdir/$_a")
             case "$_res" in
                 ok:*) _st_reach=true;  _st_ms=${_res#ok:} ;;
@@ -4552,7 +4969,7 @@ _EOST
                 "$(_json_escape "$_a")" "$(_json_escape "$_h")" \
                 "$_st_reach" "$_st_ms" "$(_json_escape "$_last")"
         done <<_EOSJ
-$(printf '%s\n' "$_aliases")
+$(printf '%s\n' "$_rows")
 _EOSJ
         printf '\n]\n'
         rm -rf "$_tmpdir"
@@ -4583,10 +5000,9 @@ _EOSJ
         "ALIAS" "HOSTNAME" "STATUS" "LAST SEEN"
     _ls_hline "  ├" "┼" "┤" "$_SW1" "$_SW2" "$_SW3" "$_SW4"
 
-    while IFS= read -r _a; do
+    _NOW=$(date +%s)
+    while IFS="$_US" read -r _a _h _last; do
         [ -z "$_a" ] && continue
-        _h=$(get_field "$_a" "HostName")
-        _last=$(pref_get "last_connect_$_a")
         _relts=$(_rel_time "$_last")
         _res=""
         [ -f "$_tmpdir/$_a" ] && _res=$(cat "$_tmpdir/$_a")
@@ -4612,7 +5028,7 @@ _EOSJ
         printf "  │ ${C_BOLD}%-18.18s${C_RESET} │ %-22.22s │ %s │ ${C_DIM}%-13.13s${C_RESET} │\n" \
             "$_a" "$_h" "$_status_cell" "$_relts"
     done <<_EOST2
-$(printf '%s\n' "$_aliases")
+$(printf '%s\n' "$_rows")
 _EOST2
 
     _ls_hline "  └" "┴" "┘" "$_SW1" "$_SW2" "$_SW3" "$_SW4"
@@ -4622,6 +5038,31 @@ _EOST2
 
 # ── AUDIT ─────────────────────────────────────────────────────────────────────
 
+# _audit_scan — one record per alias, \037-separated:
+#   alias  state  threshold  override(0/1)
+#   state: off (auditing disabled for it) | missing (key file not found) | old | ok
+# Prints nothing when auditing is globally off. Shared by audit, wt_audit and
+# the startup warning so all three always agree.
+_audit_scan() {
+    _as_global=$(pref_get "audit_threshold"); [ -z "$_as_global" ] && _as_global=90
+    [ "$_as_global" = "off" ] && return 0
+    _alias_cols 1 5 13 | while IFS="$_US" read -r _a _key _at; do   # alias key threshold
+        [ -z "$_a" ] && continue
+        _t="${_at:-$_as_global}"
+        _ov=0; [ -n "$_at" ] && [ "$_at" != "$_as_global" ] && _ov=1
+        if [ "$_t" = "off" ]; then
+            _st=off
+        elif [ -z "$_key" ] || [ ! -f "$_key" ]; then
+            _st=missing
+        elif [ -n "$(find "$_key" -prune -mtime "+$_t" 2>/dev/null)" ]; then
+            _st=old
+        else
+            _st=ok
+        fi
+        printf '%s\037%s\037%s\037%s\n' "$_a" "$_st" "$_t" "$_ov"
+    done
+}
+
 cmd_audit() {
     _threshold=$(pref_get "audit_threshold")
     [ -z "$_threshold" ] && _threshold=90
@@ -4630,8 +5071,8 @@ cmd_audit() {
         printf "  Re-enable: ${C_BOLD}okssh prefer audit_threshold 90${C_RESET}\n\n"
         return 0
     fi
-    _aliases=$(list_aliases)
-    if [ -z "$_aliases" ]; then
+    _scan=$(_audit_scan)
+    if [ -z "$_scan" ]; then
         printf '\n  No aliases configured.\n\n'; return 0
     fi
     printf '\n'
@@ -4641,36 +5082,27 @@ cmd_audit() {
         21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
         41 42 43 44 45 46 2>/dev/null; printf '\n\n'
     _flagged=0; _ok=0; _skipped=0
-    while IFS= read -r _a; do
+    while IFS="$_US" read -r _a _st _t _ov; do
         [ -z "$_a" ] && continue
-        _alias_thresh=$(pref_get "audit_threshold_${_a}")
-        [ -z "$_alias_thresh" ] && _alias_thresh=$_threshold
-        if [ "$_alias_thresh" = "off" ]; then
-            printf "  ${C_DIM}—  %-18s auditing disabled${C_RESET}\n" "$_a"
-            _skipped=$(( _skipped + 1 ))
-            continue
-        fi
         _thresh_note=""
-        [ "$_alias_thresh" != "$_threshold" ] && _thresh_note="  ${C_DIM}[override: ${_alias_thresh}d]${C_RESET}"
-        _key=$(get_field "$_a" "IdentityFile")
-        if [ -z "$_key" ] || [ ! -f "$_key" ]; then
-            printf "  ${C_YELLOW}⚠${C_RESET}  ${C_BOLD}%-18s${C_RESET} key file not found%b\n" "$_a" "$_thresh_note"
-            _flagged=$(( _flagged + 1 ))
-            continue
-        fi
-        _kname=$(basename "$_key")
-        if find "$SSH_DIR" -maxdepth 1 -name "$_kname" -mtime "+${_alias_thresh}" \
-                2>/dev/null | grep -q .; then
-            printf "  ${C_YELLOW}⚠${C_RESET}  ${C_BOLD}%-18s${C_RESET} key >%s days old — " \
-                "$_a" "$_alias_thresh"
-            printf "rotate: ${C_DIM}okssh rotate %s${C_RESET}%b\n" "$_a" "$_thresh_note"
-            _flagged=$(( _flagged + 1 ))
-        else
-            printf "  ${C_GREEN}✔${C_RESET}  ${C_BOLD}%-18s${C_RESET} key is current%b\n" "$_a" "$_thresh_note"
-            _ok=$(( _ok + 1 ))
-        fi
+        [ "$_ov" = "1" ] && _thresh_note="  ${C_DIM}[override: ${_t}d]${C_RESET}"
+        case "$_st" in
+            off)
+                printf "  ${C_DIM}—  %-18s auditing disabled${C_RESET}\n" "$_a"
+                _skipped=$(( _skipped + 1 )) ;;
+            missing)
+                printf "  ${C_YELLOW}⚠${C_RESET}  ${C_BOLD}%-18s${C_RESET} key file not found%b\n" "$_a" "$_thresh_note"
+                _flagged=$(( _flagged + 1 )) ;;
+            old)
+                printf "  ${C_YELLOW}⚠${C_RESET}  ${C_BOLD}%-18s${C_RESET} key >%s days old — " "$_a" "$_t"
+                printf "rotate: ${C_DIM}okssh rotate %s${C_RESET}%b\n" "$_a" "$_thresh_note"
+                _flagged=$(( _flagged + 1 )) ;;
+            *)
+                printf "  ${C_GREEN}✔${C_RESET}  ${C_BOLD}%-18s${C_RESET} key is current%b\n" "$_a" "$_thresh_note"
+                _ok=$(( _ok + 1 )) ;;
+        esac
     done <<_EOAUDIT
-$(printf '%s\n' "$_aliases")
+$(printf '%s\n' "$_scan")
 _EOAUDIT
     printf '\n'
     if [ "$_flagged" -eq 0 ]; then
@@ -4767,26 +5199,32 @@ cmd_diff() {
     _remote_export="$_sync_path/aliases-export.txt"
     [ -f "$_remote_export" ] || die "No sync export found at: $_remote_export"
 
+    # Compare alias records only: the two files' header comments (version,
+    # date) always differ, and blank separator lines aren't meaningful.
     _local_tmp=$(mktemp 2>/dev/null || mktemp -t okssh)
-    cmd_export "$_local_tmp" >/dev/null 2>&1
+    _remote_tmp=$(mktemp 2>/dev/null || mktemp -t okssh)
+    _export_body | grep -v -e '^#' -e '^[[:space:]]*$' > "$_local_tmp" || true
+    grep -v -e '^#' -e '^[[:space:]]*$' "$_remote_export" > "$_remote_tmp" || true
 
     printf '\n'
     info "Diff: local aliases vs sync export"
-    printf "  ${C_DIM}− removed from local  /  + added locally${C_RESET}\n\n"
+    printf "  ${C_DIM}− only in sync export  /  + only local${C_RESET}\n\n"
 
-    if diff "$_remote_export" "$_local_tmp" >/dev/null 2>&1; then
+    if diff "$_remote_tmp" "$_local_tmp" >/dev/null 2>&1; then
         success "Local aliases match the sync export — no differences."
     else
-        diff "$_remote_export" "$_local_tmp" | grep '^[+\-]' | grep -v '^---\|^+++' \
-            | while IFS= read -r _dl; do
-                case "$_dl" in
-                    +*) printf "  ${C_GREEN}%s${C_RESET}\n" "$_dl" ;;
-                    -*) printf "  ${C_YELLOW}%s${C_RESET}\n" "$_dl" ;;
-                esac
-            done
+        # unified format; drop the ---/+++ file header lines
+        diff -u "$_remote_tmp" "$_local_tmp" | tail -n +3 | while IFS= read -r _dl; do
+            case "$_dl" in
+                +*)  printf "  ${C_GREEN}%s${C_RESET}\n" "$_dl" ;;
+                -*)  printf "  ${C_YELLOW}%s${C_RESET}\n" "$_dl" ;;
+                @@*) printf "  ${C_DIM}%s${C_RESET}\n" "$_dl" ;;
+                *)   printf "  %s\n" "$_dl" ;;
+            esac
+        done
         printf '\n'
     fi
-    rm -f "$_local_tmp"
+    rm -f "$_local_tmp" "$_remote_tmp"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4844,11 +5282,38 @@ tunnel_is_running() {
     ssh -O check -S "$_sock" placeholder 2>/dev/null
 }
 
+# Interactive `okssh tunnel add` (no arguments) — CLI or whiptail
+_tunnel_add_wizard() {
+    wt_input "Tunnel name (e.g. pg-prod)" ""
+    [ -z "$_PROMPT_RESULT" ] && { printf '  Cancelled.\n\n'; return 0; }
+    _tw_name="$_PROMPT_RESULT"
+    if [ "$HAS_WHIPTAIL" -eq 1 ]; then
+        wt_pick_alias "Select SSH alias" || return 0
+        _tw_alias="$SELECTED_ALIAS"
+    else
+        cmd_list
+        cli_prompt "SSH alias to tunnel through" ""
+        _tw_alias="$_PROMPT_RESULT"
+    fi
+    [ -z "$_tw_alias" ] && { printf '  Cancelled.\n\n'; return 0; }
+    wt_input "Forward type: local (-L) / remote (-R) / socks (-D)" "local"
+    case "$_PROMPT_RESULT" in local|remote|socks) _tw_type="$_PROMPT_RESULT" ;; *) _tw_type="local" ;; esac
+    if [ "$_tw_type" = "socks" ]; then
+        wt_input "Local SOCKS port (e.g. 1080)" "1080"
+    else
+        wt_input "Forward spec (local_port:remote_host:remote_port)" ""
+    fi
+    [ -z "$_PROMPT_RESULT" ] && { printf '  Cancelled.\n\n'; return 0; }
+    cmd_tunnel add "$_tw_name" "$_tw_alias" "$_PROMPT_RESULT" --type "$_tw_type"
+}
+
 cmd_tunnel() {
     _sub="${1:-status}"
     case "$_sub" in
 
         add)
+            # no arguments → interactive wizard (used by sshop's Tunnels "add")
+            if [ -z "${2:-}" ]; then _tunnel_add_wizard; return 0; fi
             _tname="${2:-}"; _talias="${3:-}"; _tfwd="${4:-}"; _ttype="local"
             shift 4 2>/dev/null || true
             while [ "$#" -gt 0 ]; do
@@ -4859,6 +5324,10 @@ cmd_tunnel() {
             done
             { [ -z "$_tname" ] || [ -z "$_talias" ] || [ -z "$_tfwd" ]; } && \
                 die "Usage: okssh tunnel add <name> <alias> <spec> [--type local|remote|socks]"
+            # the name becomes a control-socket file name
+            case "$_tname" in
+                *[!A-Za-z0-9._-]*|.*) die "Tunnel name may only contain letters, digits, '.', '_' and '-'" ;;
+            esac
             alias_exists "$_talias" || die "Alias \"$_talias\" not found."
             case "$_ttype" in
                 local|remote)
@@ -5009,7 +5478,6 @@ cmd_agent() {
     case "$_sub" in
 
         list|ls)
-            _loaded=$(ssh-add -l 2>/dev/null || true)
             _aliases=$(list_aliases)
             if [ -z "$_aliases" ]; then
                 printf '\n  No aliases configured.\n\n'; return 0
@@ -5020,18 +5488,11 @@ cmd_agent() {
                 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
                 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
                 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 2>/dev/null; printf '\n'
-            printf '%s\n' "$_aliases" | while IFS= read -r _a; do
-                [ -z "$_a" ] && continue
-                _key=$(get_field "$_a" "IdentityFile")
-                [ -z "$_key" ] && continue
-                _fp=""
-                [ -f "$_key" ] && _fp=$(ssh-keygen -lf "$_key" 2>/dev/null | awk '{print $2}')
-                if [ -n "$_fp" ] && printf '%s\n' "$_loaded" | grep -qF "$_fp"; then
-                    printf "  ${C_BOLD}%-18s${C_RESET}  ${C_GREEN}yes${C_RESET}     %s\n" \
-                        "$_a" "$(basename "$_key")"
+            _agent_key_rows | while IFS="$_US" read -r _a _kb _yn; do
+                if [ "$_yn" = "yes" ]; then
+                    printf "  ${C_BOLD}%-18s${C_RESET}  ${C_GREEN}yes${C_RESET}     %s\n" "$_a" "$_kb"
                 else
-                    printf "  ${C_BOLD}%-18s${C_RESET}  ${C_DIM}no${C_RESET}      %s\n" \
-                        "$_a" "$(basename "$_key")"
+                    printf "  ${C_BOLD}%-18s${C_RESET}  ${C_DIM}no${C_RESET}      %s\n" "$_a" "$_kb"
                 fi
             done
             printf '\n'
@@ -5540,30 +6001,8 @@ _wt_bootstrap_menu() {
 
 # Startup audit check — print one-liner warning if keys need rotation (interactive only)
 _startup_audit_warn() {
-    _threshold=$(pref_get "audit_threshold")
-    [ -z "$_threshold" ] && _threshold=90
-    [ "$_threshold" = "off" ] && return 0
-    _aliases=$(list_aliases)
-    [ -z "$_aliases" ] && return 0
-    _flagged=0
-    while IFS= read -r _a; do
-        [ -z "$_a" ] && continue
-        _alias_thresh=$(pref_get "audit_threshold_${_a}")
-        [ -z "$_alias_thresh" ] && _alias_thresh=$_threshold
-        [ "$_alias_thresh" = "off" ] && continue
-        _key=$(get_field "$_a" "IdentityFile")
-        if [ -z "$_key" ] || [ ! -f "$_key" ]; then
-            _flagged=$(( _flagged + 1 )); continue
-        fi
-        _kname=$(basename "$_key")
-        if find "$SSH_DIR" -maxdepth 1 -name "$_kname" -mtime "+${_alias_thresh}" \
-                2>/dev/null | grep -q .; then
-            _flagged=$(( _flagged + 1 ))
-        fi
-    done <<_EOSW
-$(printf '%s\n' "$_aliases")
-_EOSW
-    if [ "$_flagged" -gt 0 ]; then
+    _flagged=$(_audit_scan | awk -F "$_US" '$2 == "old" || $2 == "missing"' | grep -c . || true)
+    if [ "${_flagged:-0}" -gt 0 ]; then
         printf "  ${C_YELLOW}⚠${C_RESET}  ${C_BOLD}%d key(s) need rotation${C_RESET}  ${C_DIM}(run: okssh audit)${C_RESET}\n\n" \
             "$_flagged"
     fi
@@ -6019,6 +6458,7 @@ cmd_help() {
     printf "  ${C_BOLD}COMMANDS${C_RESET}\n"
     printf "    %-36s %s\n" "okssh [-v]"                    "Interactive menu"
     printf "    %-36s %s\n" "okssh [-v] add"                "Add a new SSH alias"
+    printf "    %-36s %s\n" "okssh [-v] import-key"         "Register a private key sent to you"
     printf "    %-36s %s\n" "okssh [-v] connect <alias>"    "Connect to a saved alias"
     printf "    %-36s %s\n" "okssh [-v] ls|list"            "List all aliases"
     printf "    %-36s %s\n" "okssh [-v] info <alias>"       "Full details + fingerprint"
@@ -6027,7 +6467,8 @@ cmd_help() {
     printf "    %-36s %s\n" "okssh [-v] rotate <alias>"     "Rotate SSH key"
     printf "    %-36s %s\n" "okssh [-v] rm <alias>"         "Remove alias (+ optional key delete)"
     printf "    %-36s %s\n" "okssh [-v] rm <alias> --yes [--keys]" "Non-interactive remove (--keys deletes key pair)"
-    printf "    %-36s %s\n" "okssh [-v] export [file]"      "Export aliases to portable file"
+    printf "    %-36s %s\n" "okssh [-v] export [file|-]"    "Export aliases to portable file (- = stdout)"
+    printf "    %-36s %s\n" "okssh [-v] export --ansible"   "Export an Ansible INI inventory"
     printf "    %-36s %s\n" "okssh [-v] import <file>"      "Import aliases from export file"
     printf "    %-36s %s\n" "okssh [-v] run <alias> <cmd>"  "Run a one-off remote command"
     printf "    %-36s %s\n" "okssh [-v] copy <src> <dst>"   "Copy files via sftp (alias:/path)"
@@ -6073,6 +6514,8 @@ cmd_help() {
     printf '\n'
     printf "  ${C_BOLD}FLAGS${C_RESET}\n"
     printf "    -v | --verbose    Show background operations (sync, key gen, config writes)\n"
+    printf "    Colours are off when output is not a terminal; NO_COLOR=1 disables them,\n"
+    printf "    CLICOLOR_FORCE=1 forces them on.\n"
     printf '\n'
     printf "  ${C_BOLD}FEATURES${C_RESET}\n"
     printf "    • Per-alias keys: ed25519 (default), rsa-4096, or ecdsa-521\n"
@@ -6129,7 +6572,7 @@ case "${1:-}" in
     edit)              cmd_edit   "${2:-}" ;;
     rotate)            cmd_rotate "${2:-}" ;;
     rm|remove)         shift; cmd_remove "$@" ;;
-    export)            cmd_export "${2:-}" ;;
+    export)            shift; cmd_export "$@" ;;
     import)            cmd_import "${2:-}" ;;
     prefer)            cmd_prefer "${2:-}" "${3:-}" "${4:-}" ;;
     run)               _run_alias="${2:-}"; shift 2 2>/dev/null || true; cmd_run "$_run_alias" "$@" ;;
