@@ -189,6 +189,13 @@ ok prefer key_type ecdsa </dev/null >/dev/null 2>&1
 check '[ "$(grep -c "^key_type=" "$PREFS")" = 1 ] && has "$PREFS" "key_type=ecdsa"' "pref_set replaces in place"
 check '[ "$(stat -c %a "$PREFS" 2>/dev/null || stat -f %Lp "$PREFS")" = 600 ]' "prefs stay mode 600"
 
+begin "prefs are written through the sync-folder symlink"
+mkdir -p "$H/sync"; printf 'a=1\n' > "$H/sync/preferences"
+rm -f "$PREFS"; ln -s "$H/sync/preferences" "$PREFS"
+ok prefer key_type rsa </dev/null >/dev/null 2>&1
+check '[ -L "$PREFS" ]'                                       "symlink kept"
+check 'has "$H/sync/preferences" "key_type=rsa" && has "$H/sync/preferences" "a=1"' "value lands in the synced file"
+
 begin "export: stdout, portable format, Ansible inventory"
 std_config
 ok export - </dev/null > "$H/exp" 2>/dev/null

@@ -84,26 +84,8 @@ fi
 
 SSH_DIR="$HOME/.ssh"
 CONFIG_FILE="$SSH_DIR/config"
-if [ -d "$HOME/.config/termio" ] && [ ! -d "$HOME/.config/okssh" ]; then
-    mv "$HOME/.config/termio" "$HOME/.config/okssh"
-    printf "Migrated ~/.config/termio → ~/.config/okssh\n"
-fi
-
 CONF_DIR="$HOME/.config/okssh"
 PREF_FILE="$CONF_DIR/preferences"
-
-if [ -f "$PREF_FILE" ]; then
-    _old_sync=$(sed -n 's/^sync_path=//p' "$PREF_FILE" | head -n 1)
-    if [ -n "$_old_sync" ] && [ "${_old_sync##*/}" = "termio-sync" ]; then
-        _new_sync="${_old_sync%/termio-sync}/okssh-sync"
-        if [ -d "$_old_sync" ] && [ ! -d "$_new_sync" ]; then
-            mv "$_old_sync" "$_new_sync"
-            printf "Migrated %s → %s\n" "$_old_sync" "$_new_sync"
-        fi
-        sed -i "s|^sync_path=.*|sync_path=$_new_sync|" "$PREF_FILE"
-    fi
-    unset _old_sync _new_sync
-fi
 
 _snip_migrate_file="$CONF_DIR/snippets"
 # The old format is "[snippet]" blocks with cmd= fields. Checking for cmd= too
@@ -277,16 +259,25 @@ pref_set() {
         index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next }
         { print }
         END { if (!done) print k "=" v }
-    ' "$PREF_FILE" > "${PREF_FILE}.tmp" && mv "${PREF_FILE}.tmp" "$PREF_FILE"
-    chmod 600 "$PREF_FILE"   # after mv — the temp file was created with the umask
+    ' "$PREF_FILE" > "${PREF_FILE}.tmp" && _pref_replace
     vlog "pref_set: $1 → $PREF_FILE"
 }
 
 pref_del() {
     [ -f "$PREF_FILE" ] || return 0
-    awk -v k="$1" 'index($0, k "=") != 1' "$PREF_FILE" > "${PREF_FILE}.tmp" \
-        && mv "${PREF_FILE}.tmp" "$PREF_FILE"
-    chmod 600 "$PREF_FILE"
+    awk -v k="$1" 'index($0, k "=") != 1' "$PREF_FILE" > "${PREF_FILE}.tmp" && _pref_replace
+}
+
+# Install ${PREF_FILE}.tmp as the preferences file. `okssh sync init` makes
+# PREF_FILE a symlink into the sync folder — write THROUGH it (mv would
+# replace the link with a plain file and silently stop syncing).
+_pref_replace() {
+    if [ -L "$PREF_FILE" ]; then
+        cat "${PREF_FILE}.tmp" > "$PREF_FILE" && rm -f "${PREF_FILE}.tmp"
+    else
+        mv "${PREF_FILE}.tmp" "$PREF_FILE"
+    fi
+    chmod 600 "$PREF_FILE"   # the temp file was created with the umask
 }
 
 # Per-alias preference prefixes ("<prefix>_<alias>") — rename moves them,
@@ -1078,7 +1069,7 @@ cmd_bootstrap() {
 }
 
 # Push shell-init.sh + the snippet list and wire the source line into
-# ~/.zshrc / ~/.bashrc (migrating old termio lines) — all in ONE round trip:
+# ~/.zshrc / ~/.bashrc — all in ONE round trip:
 # both files travel over stdin, split at $_OKSSH_SNIP_SEP. Used by install
 # and update, so update keeps everything install set up.
 _bootstrap_push_all() {
@@ -1097,18 +1088,26 @@ _bootstrap_push_all() {
             printf "%s\n" "$l" >> "$out"
         done
         mv "$f.tmp" "$f" && mv "$s.tmp" "$s" && chmod 600 "$f" || exit 1
-        [ -d "$HOME/.config/termio" ] && cp "$s" "$HOME/.config/termio/snippet-list.txt" 2>/dev/null
         _sl="[ -f \"$HOME/.config/okssh/shell-init.sh\" ] && . \"$HOME/.config/okssh/shell-init.sh\""
         for _sf in "$HOME/.zshrc" "$HOME/.bashrc"; do
             [ -f "$_sf" ] || continue
+            # hosts bootstrapped before the termio → okssh rename: drop the
+            # old source block (the okssh one is added below)
             if grep -q "termio/shell-init" "$_sf" 2>/dev/null; then
                 sed -i "/^# termio profile$/d; /termio\/shell-init\.sh/d" "$_sf" 2>/dev/null \
                     || sed -i "" "/^# termio profile$/d; /termio\/shell-init\.sh/d" "$_sf" 2>/dev/null || true
+                printf "  removed the old termio profile from %s\n" "$_sf"
             fi
             grep -qF "okssh/shell-init.sh" "$_sf" 2>/dev/null && continue
             printf "\n# okssh profile\n%s\n" "$_sl" >> "$_sf"
             printf "  wired into %s\n" "$_sf"
         done
+        # …and its files (only the two the old bootstrap wrote; rmdir leaves
+        # the directory alone if anything else is in it)
+        if [ -d "$HOME/.config/termio" ]; then
+            rm -f "$HOME/.config/termio/shell-init.sh" "$HOME/.config/termio/snippet-list.txt"
+            rmdir "$HOME/.config/termio" 2>/dev/null || true
+        fi
         exit 0
     '
 }
@@ -1130,9 +1129,7 @@ _bootstrap_push_snips() {
     _bpa="$1"
     _okssh_snip_list_content | ssh -F "$CONFIG_FILE" "$_bpa" '
         mkdir -p "$HOME/.config/okssh"
-        tee "$HOME/.config/okssh/snippet-list.txt" > /dev/null
-        [ -d "$HOME/.config/termio" ] && \
-            cp "$HOME/.config/okssh/snippet-list.txt" "$HOME/.config/termio/snippet-list.txt" 2>/dev/null || true
+        cat > "$HOME/.config/okssh/snippet-list.txt"
     '
 }
 
